@@ -201,16 +201,17 @@ For local development with Claude Code, use stdio mode instead of SSE. Add to `~
 
 ---
 
-> **Security notice — demo configuration**
-> This server is configured for getting-started simplicity. Before deploying
-> beyond a local/ngrok demo session:
-> - **Add MCP server authentication** — no bearer token is required by default;
->   anyone who can reach the SSE endpoint can invoke all tools including `tqnn_store`.
-> - **Restrict CORS** — set `CORS_ORIGIN=https://claude.ai` in production.
-> - **Remove `NODE_TLS_REJECT_UNAUTHORIZED=0`** when using a public HTTPS DMM endpoint.
-> - **Add request body size limits** and rate limiting before exposing to untrusted clients.
-> - The `.env` parser does not handle values containing `=` signs correctly — use
->   `npm install dotenv` for production secrets management.
+## ⚠️ Security notice — demo configuration
+
+This server is configured for getting-started simplicity. The defaults are appropriate for a local or ngrok-tunnelled demo session. Before deploying beyond that, be aware of the following.
+
+ - **Add MCP server authentication** — no bearer token is required by default;
+   anyone who can reach the SSE endpoint can invoke all tools including `tqnn_store`.
+ - **Restrict CORS** — set `CORS_ORIGIN=https://claude.ai` in production.
+ - **Remove `NODE_TLS_REJECT_UNAUTHORIZED=0`** when using a public HTTPS DMM endpoint.
+ - **Add request body size limits** and rate limiting before exposing to untrusted clients.
+ - The `.env` parser does not handle values containing `=` signs correctly — use
+   `npm install dotenv` for production secrets management.
 
 ---
 
