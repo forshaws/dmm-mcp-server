@@ -1,0 +1,21 @@
+{
+  "name": "tqnn-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server exposing TQNN DMM associative memory as callable tools for Claude and other MCP-compatible LLMs",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "start:sse": "MCP_MODE=sse node index.js",
+    "test": "node test.js"
+  },
+  "keywords": ["mcp", "tqnn", "dmm", "associative-memory", "claude", "llm"],
+  "author": "Toridion Ltd",
+  "license": "CC-BY-NC-4.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
