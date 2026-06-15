@@ -178,6 +178,23 @@ server.tool(
   },
   async ({ filereference, pattern, dataset, create_ots = false }) => {
     try {
+      // Validate pattern is parseable JSON and is a JSON array
+      let parsedPattern;
+      try {
+        parsedPattern = JSON.parse(pattern);
+      } catch {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'pattern must be a valid JSON array string e.g. [{"title":"Report","year":2024}]' }, null, 2) }],
+          isError: true
+        };
+      }
+      if (!Array.isArray(parsedPattern)) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'pattern must be a JSON array — wrap your object in [ ] e.g. [{"title":"Report","year":2024}]' }, null, 2) }],
+          isError: true
+        };
+      }
+
       // Ensure filereference ends with ::
       const ref = filereference.endsWith('::') ? filereference : filereference + '::';
       const result = await client.storeDoc(ref, pattern, dataset, create_ots);
