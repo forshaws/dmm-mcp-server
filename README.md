@@ -71,14 +71,22 @@ If this fails, check your `TQNN_BASE_URL`, credentials, and network. Fix this be
 
 ---
 
-### 3. Run in SSE mode and expose with ngrok
+### 3. Run in SSE mode
 
 SSE mode starts an HTTP server that claude.ai can connect to via the MCP Integrations panel.
+
+Add `MCP_MODE=sse` to your `.env` file:
+
+```env
+MCP_MODE=sse
+```
+
+#### Option A — Local machine (development)
 
 **Terminal 1 — start the MCP server:**
 
 ```bash
-MCP_MODE=sse node index.js
+node index.js
 ```
 
 You should see:
@@ -101,13 +109,85 @@ ngrok will print a forwarding URL like:
 Forwarding  https://abc123.ngrok-free.app -> http://localhost:3100
 ```
 
-Copy that HTTPS URL — you'll need it in the next step.
+Copy that HTTPS URL — you'll need it in step 5.
 
 > **No ngrok account?** Sign up free at [ngrok.com](https://ngrok.com). The free tier is sufficient.
 
 ---
 
-### 4. Verify the MCP protocol (optional but recommended)
+#### Option B — Remote server or Raspberry Pi (persistent deployment)
+
+For a persistent deployment that survives SSH disconnects and reboots — such as running the MCP server on a Raspberry Pi 5 alongside the TQNN DMM appliance — use **pm2** as a process manager and **ngrok** for HTTPS tunnelling.
+
+**Install pm2 and ngrok:**
+
+```bash
+sudo npm install -g pm2
+
+# Install ngrok
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+sudo apt update && sudo apt install ngrok
+
+# Authenticate ngrok (one time)
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+```
+
+**Start ngrok in the background:**
+
+```bash
+nohup ngrok http 3100 > ~/ngrok.log 2>&1 &
+
+# Get your public URL
+curl -s http://localhost:4040/api/tunnels | grep -o '"public_url":"[^"]*"' | head -1
+```
+
+**Start the MCP server with pm2:**
+
+```bash
+cd ~/dmm-mcp-server
+pm2 start index.js --name tqnn-mcp
+pm2 save
+```
+
+**Register pm2 to start on boot** (copy and run the command pm2 prints):
+
+```bash
+pm2 startup
+# Then run the sudo command it outputs, e.g.:
+# sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u tqnn --hp /home/tqnn
+```
+
+**Verify everything is running:**
+
+```bash
+pm2 status
+curl http://localhost:3100/health
+curl https://abc123.ngrok-free.app/health
+```
+
+You can now safely close your SSH session — both ngrok and the MCP server will keep running.
+
+**Useful pm2 commands:**
+
+```bash
+pm2 status              # show running processes
+pm2 logs tqnn-mcp       # tail live logs
+pm2 restart tqnn-mcp    # restart after config changes
+pm2 stop tqnn-mcp       # stop the server
+```
+
+**Pulling updates from GitHub:**
+
+```bash
+cd ~/dmm-mcp-server
+git pull
+pm2 restart tqnn-mcp
+```
+
+---
+
+### 4. Verify the MCP protocol (optional but recommended — local only)
 
 With the server running in SSE mode, run the MCP protocol test suite:
 
