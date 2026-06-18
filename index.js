@@ -1,5 +1,5 @@
 // index.js — TQNN DMM MCP Server
-// TQNN MCP Server v1.0.0
+// TQNN MCP Server v1.0.1
 //
 // Exposes TQNN DMM associative memory as MCP tools for Claude and other
 // MCP-compatible LLMs.
@@ -109,7 +109,7 @@ server.tool(
   },
   async ({ query, dataset, return_filelist = 1 }) => {
     try {
-      const hash = pqrHash(query.trim().toLowerCase());
+      const hash = pqrHash(query.trim());
       const result = await client.searchDoc(hash, dataset);
       const filelist = (result.filelist || '').split('\n').map(r => r.trim()).filter(Boolean);
       return {
