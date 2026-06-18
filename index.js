@@ -1,5 +1,5 @@
 // index.js — TQNN DMM MCP Server
-// TQNN MCP Server v1.1.0
+// TQNN MCP Server v1.2.0
 //
 // Exposes TQNN DMM associative memory as MCP tools for Claude and other
 // MCP-compatible LLMs.
@@ -79,7 +79,7 @@ const client = new TQNNClient({
 // ── MCP Server ─────────────────────────────────────────────────────────────────
 const server = new McpServer({
   name: 'tqnn-dmm',
-  version: '1.1.0'
+  version: '1.2.0'
 });
 
 // ── Tool: tqnn_status ─────────────────────────────────────────────────────────
@@ -287,7 +287,7 @@ async function startSSE() {
       res.end(JSON.stringify({
         status: 'ok',
         server: 'tqnn-mcp-server',
-        version: '1.1.0',
+        version: '1.2.0',
         auth: 'oauth2.1',
         base_url: CONFIG.baseUrl,
         dataset: CONFIG.dataset || '(default)'
