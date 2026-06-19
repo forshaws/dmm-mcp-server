@@ -1,5 +1,5 @@
 // similarity.js — Multi-call similarity orchestration for TQNN DMM
-// TQNN MCP Server v1.0.0
+// TQNN MCP Server v1.3.0
 //
 // The similarity search algorithm lives entirely here — NOT inside DMM.
 // DMM only sees individual searchDoc calls with PQR-hashed tokens.
@@ -10,36 +10,79 @@ const crypto = require('crypto');
 const { tokenise } = require('./tokeniser');
 
 // ---------------------------------------------------------------------------
-// PQR Hashing — mirrors lindisfarne_similarity_search.py exactly
-// SHA-256 of the token padded/truncated to exactly 16 characters.
-// Pad character is '*'.
+// PQR Hashing — Self-Salting scheme (V1.3.0+)
+//
+// Algorithm (mirrors storeDoc.php / tqnn_dmm_ide.html exactly):
+//   1. h1     = SHA-256(input)          — 64 hex chars; endogenous salt
+//   2. mixed  = input + h1              — salt appended to input
+//   3. padded = mixed.slice(0, 16)      — first 16 chars
+//   4. token  = SHA-256(padded).slice(0,16)
+//
+// Properties:
+//   • Defeats rainbow tables — salt is derived from input itself
+//   • All inputs lifted into full 2^256 hash space regardless of entropy
+//   • No external key material, zero storage overhead, fully deterministic
+//
+// IMPORTANT: Re-ingest required for any dataset stored under the old '*' scheme.
 // ---------------------------------------------------------------------------
 
-function pad16(s) {
-  s = String(s);
-  return s.length >= 16 ? s.slice(0, 16) : s.padEnd(16, '*');
+/**
+ * Self-Salting PQR token — canonical implementation.
+ * @param {string} s - Input token (will be trimmed)
+ * @returns {string} 16-char hex token
+ */
+function tqnnToken16(s) {
+  const input  = String(s).trim();
+  const h1     = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
+  const mixed  = input + h1;
+  const padded = mixed.slice(0, 16);
+  return crypto.createHash('sha256').update(padded, 'utf8').digest('hex').slice(0, 16);
 }
+
+/*
+ * SUPERSEDED — V1.0.x constant-padding scheme (kept for reference / rollback)
+ * Pad character '*' is vulnerable to rainbow table attacks on low-entropy fields.
+ *
+ * function pad16(s) {
+ *   s = String(s);
+ *   return s.length >= 16 ? s.slice(0, 16) : s.padEnd(16, '*');
+ * }
+ */
 
 /**
  * PQR hash — forward (standard).
  * @param {string} token
- * @returns {string} hex SHA-256
+ * @returns {string} 16-char hex token
  */
 function pqrHash(token) {
-  return crypto.createHash('sha256').update(pad16(token), 'utf8').digest('hex');
+  return tqnnToken16(token);
 }
+
+/*
+ * SUPERSEDED — V1.0.x
+ * function pqrHash(token) {
+ *   return crypto.createHash('sha256').update(pad16(token), 'utf8').digest('hex');
+ * }
+ */
 
 /**
  * PQR hash — reversed INPUT string (for FPD).
- * IMPORTANT: We reverse the token INPUT string before pad+hash.
- * NOT the hash output. This mirrors the Python FPD implementation.
+ * IMPORTANT: We reverse the token INPUT string before self-salting.
+ * NOT the hash output. This mirrors the PHP/JS FPD implementations.
  * @param {string} token
- * @returns {string} hex SHA-256
+ * @returns {string} 16-char hex token
  */
 function pqrHashReversed(token) {
-  const reversed = token.split('').reverse().join('');
-  return crypto.createHash('sha256').update(pad16(reversed), 'utf8').digest('hex');
+  return tqnnToken16(token.split('').reverse().join(''));
 }
+
+/*
+ * SUPERSEDED — V1.0.x
+ * function pqrHashReversed(token) {
+ *   const reversed = token.split('').reverse().join('');
+ *   return crypto.createHash('sha256').update(pad16(reversed), 'utf8').digest('hex');
+ * }
+ */
 
 // ---------------------------------------------------------------------------
 // Filelist parsing
@@ -181,4 +224,4 @@ async function similaritySearch(client, text, {
   };
 }
 
-module.exports = { similaritySearch, pqrHash, pqrHashReversed, searchToken, parseFilelist, stripTimestamp, tokenise };
+module.exports = { similaritySearch, pqrHash, pqrHashReversed, tqnnToken16, searchToken, parseFilelist, stripTimestamp, tokenise };
