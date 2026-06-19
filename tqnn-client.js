@@ -1,5 +1,5 @@
 // tqnn-client.js — Core DMM HTTP calls using multipart/form-data
-// TQNN MCP Server v1.0.0
+// TQNN MCP Server v1.3.0
 //
 // All DMM API calls use multipart/form-data, NOT JSON body.
 // Uses Node 18+ built-in FormData + fetch — no extra npm package needed.
@@ -63,16 +63,30 @@ class TQNNClient {
   }
 
   /**
-   * Lightweight connectivity ping using a known-harmless hash.
+   * Lightweight connectivity ping using a known-harmless token.
+   * Uses self-salting PQR scheme (V1.3.0+) — matches tqnnToken16() in similarity.js.
    * @returns {Promise<ApiResponse>}
    */
   async ping() {
-    const crypto = require('crypto');
-    const token = '__ping__';
-    const padded = token.length >= 16 ? token.slice(0, 16) : token.padEnd(16, '*');
-    const pingHash = crypto.createHash('sha256').update(padded, 'utf8').digest('hex');
+    const crypto   = require('crypto');
+    const input    = '__ping__';
+    const h1       = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
+    const padded   = (input + h1).slice(0, 16);
+    const pingHash = crypto.createHash('sha256').update(padded, 'utf8').digest('hex').slice(0, 16);
     return this._post('/v1/searchDoc', { pattern: pingHash });
   }
+
+  /*
+   * SUPERSEDED — V1.0.x constant-padding ping
+   *
+   * async ping() {
+   *   const crypto = require('crypto');
+   *   const token = '__ping__';
+   *   const padded = token.length >= 16 ? token.slice(0, 16) : token.padEnd(16, '*');
+   *   const pingHash = crypto.createHash('sha256').update(padded, 'utf8').digest('hex');
+   *   return this._post('/v1/searchDoc', { pattern: pingHash });
+   * }
+   */
 
   /**
    * Authenticate credentials against DMM.
