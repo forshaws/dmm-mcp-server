@@ -1,5 +1,6 @@
 // tokeniser.js — General-purpose tokeniser for TQNN similarity search
 // Ported from lindisfarne_similarity_search.py
+// V1.3.1 — Preserve token case for PQR hashing (self-salting scheme is case-sensitive)
 
 const STOPWORDS = new Set([
   // Generic English stopwords
@@ -23,15 +24,17 @@ const MIN_TOKEN_LENGTH = 4;
 /**
  * Tokenise free text into meaningful search tokens.
  * Strips stopwords, deduplicates, enforces minimum length.
+ * Case is PRESERVED — PQR self-salting scheme (V1.3.0+) is case-sensitive.
+ * Stopword matching is case-insensitive (compared against lowercase STOPWORDS set).
  * @param {string} text - Any free text input
- * @returns {string[]} - Array of unique meaningful tokens
+ * @returns {string[]} - Array of unique meaningful tokens (original case retained)
  */
 function tokenise(text) {
-  const words = text.toLowerCase().match(/[a-z]+/g) || [];
+  const words = text.match(/[a-zA-Z]+/g) || [];
   const seen = new Set();
   const tokens = [];
   for (const word of words) {
-    if (word.length >= MIN_TOKEN_LENGTH && !STOPWORDS.has(word) && !seen.has(word)) {
+    if (word.length >= MIN_TOKEN_LENGTH && !STOPWORDS.has(word.toLowerCase()) && !seen.has(word)) {
       seen.add(word);
       tokens.push(word);
     }
