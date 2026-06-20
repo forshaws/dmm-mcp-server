@@ -48,7 +48,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
-const { similaritySearch, pqrHash } = require('./similarity');
+const { similaritySearch, pqrHash, pqrHashReversed, tokenise } = require('./similarity');
 const { OAuthServer, readBody } = require('./oauth');
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -181,13 +181,16 @@ server.tool(
   'tqnn_store',
   'Store a document reference and its metadata into TQNN DMM associative memory. Use when Claude needs to persist new knowledge associations during an agentic session.',
   {
-    filereference: z.string().describe('URI or path to the document. Must end with :: e.g. url://server/path/file.pdf::'),
-    pattern: z.string().describe('JSON string of document metadata e.g. {"title":"Report","year":2024}'),
+    filereference: z.string().describe('URI or path to the document. Must end with :: e.g. memory://claude/session/2026-06-20::'),
+    pattern: z.string().describe('JSON array of metadata objects e.g. [{"title":"Report","year":2024}]. Field values are tokenised and PQR-hashed before storage.'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace.'),
+    pqr: z.boolean().default(true).optional().describe('Enable PQR hashing of pattern field values before storage. Default true. Must match search mode.'),
+    fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence — stores both forward and reversed-input hashes per token. Default true. Required for tqnn_similarity with fpd:true.'),
     create_ots: z.boolean().default(false).optional().describe('Submit SHA-256 fingerprint to OpenTimestamps Bitcoin calendar for blockchain anchoring.')
   },
-  async ({ filereference, pattern, dataset, create_ots = false }) => {
+  async ({ filereference, pattern, dataset, pqr = true, fpd = true, create_ots = false }) => {
     try {
+      // ── Parse and validate pattern ──────────────────────────────────────────
       let parsedPattern;
       try {
         parsedPattern = JSON.parse(pattern);
@@ -205,12 +208,69 @@ server.tool(
       }
 
       const ref = filereference.endsWith('::') ? filereference : filereference + '::';
-      const result = await client.storeDoc(ref, pattern, dataset, create_ots);
-      const success = (result.message || '').includes('STORE_OK');
+
+      // ── Build storable pattern ──────────────────────────────────────────────
+      // If pqr:true, tokenise every string field value and replace with
+      // PQR-hashed tokens so the stored associations match what searchDoc expects.
+      // Raw pattern is stored as-is when pqr:false (legacy / plain text mode).
+      let storePattern;
+      let fpdPattern = null;
+
+      if (pqr) {
+        // Collect all unique tokens across all field values in all objects
+        const allTokens = new Set();
+        for (const obj of parsedPattern) {
+          for (const val of Object.values(obj)) {
+            if (typeof val === 'string') {
+              for (const tok of tokenise(val)) allTokens.add(tok);
+            } else if (val !== null && val !== undefined) {
+              // Non-string scalars: stringify and treat as single token if long enough
+              const s = String(val);
+              if (s.length >= 4) allTokens.add(s);
+            }
+          }
+        }
+
+        // Forward store: hash each token, build pattern array DMM expects
+        const fwdTokens = [...allTokens].map(tok => ({ token: pqrHash(tok) }));
+        storePattern = JSON.stringify(fwdTokens);
+
+        // FPD reverse store: reverse each token INPUT string before hashing
+        if (fpd) {
+          const revTokens = [...allTokens].map(tok => ({ token: pqrHashReversed(tok) }));
+          fpdPattern = JSON.stringify(revTokens);
+        }
+      } else {
+        // pqr:false — pass pattern straight through (raw mode)
+        storePattern = pattern;
+      }
+
+      // ── Forward store ───────────────────────────────────────────────────────
+      const fwdResult = await client.storeDoc(ref, storePattern, dataset, create_ots);
+      const fwdOk = (fwdResult.tqnn_response || '').includes('STORE_OK');
+
+      // ── FPD reverse store ───────────────────────────────────────────────────
+      let revResult = null;
+      let revOk = null;
+      if (fpd && pqr && fpdPattern) {
+        revResult = await client.storeDoc(ref, fpdPattern, dataset, false);
+        revOk = (revResult.tqnn_response || '').includes('STORE_OK');
+      }
+
+      const success = fwdOk && (fpd ? revOk : true);
+
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ success, filereference: ref, dmm_response: result }, null, 2)
+          text: JSON.stringify({
+            success,
+            filereference: ref,
+            pqr_enabled: pqr,
+            fpd_enabled: fpd,
+            tokens_stored: pqr ? JSON.parse(storePattern).length : null,
+            forward_store: { ok: fwdOk, dmm_response: fwdResult },
+            ...(fpd && pqr ? { reverse_store: { ok: revOk, dmm_response: revResult } } : {})
+          }, null, 2)
         }],
         isError: !success
       };
