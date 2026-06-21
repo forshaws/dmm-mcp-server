@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server that exposes the **TQNN DMM** associative me
 
 This makes DMM a **live memory layer inside the LLM context window** — Claude can call TQNN's associative retrieval during inference without DMM knowing anything about LLMs.
 
-Licence: [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+Licence: [MIT](https://opensource.org/licenses/MIT)
 
 ---
 
