@@ -98,8 +98,14 @@ async function main() {
 
   // ── Test 2: NO_RESOLVER for unknown scheme ─────────────────────────────────
   hr('Test 2: NO_RESOLVER for unknown scheme');
+  // ftp:// is non-logical — routes to * catch-all webhook
+  // With no RESOLVER_DEFAULT_WEBHOOK_URL set → RESOLVER_NOT_CONFIGURED (correct)
   const r_unknown = await resolverDispatch('ftp://some.server/file.txt::', 'ping');
-  check('Unknown scheme → NO_RESOLVER', r_unknown, 'NO_RESOLVER');
+  check('Non-logical ftp:// → catch-all → RESOLVER_NOT_CONFIGURED', r_unknown, 'RESOLVER_NOT_CONFIGURED');
+
+  // A truly unknown LOGICAL prefix (no resolver configured) → NO_RESOLVER
+  const r_logical_unknown = await resolverDispatch('widgets_0001.jsonl::', 'ping');
+  check('Unknown logical prefix → NO_RESOLVER', r_logical_unknown, 'NO_RESOLVER');
 
   // ── Test 3: memory:// handler ──────────────────────────────────────────────
   hr('Test 3: memory:// handler');
