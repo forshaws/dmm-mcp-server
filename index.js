@@ -1,5 +1,5 @@
 // index.js — TQNN DMM MCP Server
-// TQNN MCP Server v1.3.0
+// TQNN MCP Server v1.3.1
 //
 // Exposes TQNN DMM associative memory as MCP tools for Claude and other
 // MCP-compatible LLMs.
@@ -50,6 +50,7 @@ const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
 const { similaritySearch, pqrHash, pqrHashReversed, tokenise } = require('./similarity');
 const { OAuthServer, readBody } = require('./oauth');
+const { resolverDispatch, registerMemory } = require('./resolver');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -79,7 +80,7 @@ const client = new TQNNClient({
 // ── MCP Server ─────────────────────────────────────────────────────────────────
 const server = new McpServer({
   name: 'tqnn-dmm',
-  version: '1.3.0'
+  version: '1.4.0'
 });
 
 // ── Tool: tqnn_status ─────────────────────────────────────────────────────────
@@ -259,6 +260,9 @@ server.tool(
 
       const success = fwdOk && (fpd ? revOk : true);
 
+      // ── Register in-memory record for tqnn_get resolution this session ──────
+      if (success) registerMemory(ref, pattern);
+
       return {
         content: [{
           type: 'text',
@@ -277,6 +281,53 @@ server.tool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }],
+        isError: true
+      };
+    }
+  }
+);
+
+// ── Tool: tqnn_get ────────────────────────────────────────────────────────────
+server.tool(
+  'tqnn_get',
+  [
+    'Retrieve a document or resource identified by a TQNN DMM filereference.',
+    'Three operations:',
+    '  ping  — check if the resource exists and is reachable (fast, no content returned)',
+    '  info  — get metadata: size, content type, last modified, resolver type (no content body)',
+    '  fetch — retrieve full content (text inline or base64 for binary; large files auto-zipped)',
+    'Always call ping or info before fetch for large or cold resources.',
+    'Filereferences are returned by tqnn_search and tqnn_similarity.',
+    'Resolution is handled by developer-configured resolvers in tqnn_resolvers.json.',
+    'DMM never holds file content — only associations. Content lives in developer infrastructure.'
+  ].join('\n'),
+  {
+    filereference: z.string().describe(
+      'The filereference to resolve — as returned by tqnn_search or tqnn_similarity. ' +
+      'Examples: "memory://claude/session/2026-06-20::", "records_0001.jsonl::line28::", ' +
+      '"https://example.com/report.pdf::", "glacier://archive/2024/Q1/batch::". ' +
+      'DMM-appended timestamps (::1782281928) are stripped automatically.'
+    ),
+    operation: z.enum(['ping', 'info', 'fetch']).default('ping').describe(
+      'What to do: "ping" = exists check only | "info" = metadata only | "fetch" = full content retrieval'
+    ),
+    dataset: z.string().optional().describe(
+      'Optional: dataset context hint — passed through to webhook resolvers for scoping.'
+    )
+  },
+  async ({ filereference, operation = 'ping', dataset }) => {
+    try {
+      const result = await resolverDispatch(filereference, operation, dataset);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }],
+        isError: ['ERROR', 'NO_RESOLVER', 'WEBHOOK_UNREACHABLE', 'WEBHOOK_ERROR', 'HTTP_ERROR', 'UNREACHABLE'].includes(result.status)
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ status: 'ERROR', message: err.message }, null, 2) }],
         isError: true
       };
     }
@@ -347,7 +398,7 @@ async function startSSE() {
       res.end(JSON.stringify({
         status: 'ok',
         server: 'tqnn-mcp-server',
-        version: '1.3.0',
+        version: '1.4.0',
         auth: 'oauth2.1',
         base_url: CONFIG.baseUrl,
         dataset: CONFIG.dataset || '(default)'
