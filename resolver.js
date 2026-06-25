@@ -1,4 +1,4 @@
-// resolver.js — tqnn_get resolver module for TQNN DMM MCP Server
+// resolver.js — tqnn_get resolver module for TQNN DMM MCP Server.
 // TQNN MCP Server v1.4.0
 //
 // Loads tqnn_resolvers.json and dispatches tqnn_get operations to the
