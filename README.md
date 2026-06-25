@@ -32,6 +32,7 @@ DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All high
 | `tqnn_search` | Single `searchDoc` call — fast exact associative match |
 | `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results |
 | `tqnn_store` | `storeDoc` wrapper — Claude can write associations into DMM |
+| `tqnn_get` | Resolver — retrieve content for any filereference via ping / info / fetch. See [docs/resolvers.md](docs/resolvers.md) |
 
 ---
 
@@ -292,6 +293,14 @@ pm2 restart tqnn-mcp
 | `TQNN_OAUTH_USER` | `admin` | Username for the OAuth consent page |
 | `TQNN_OAUTH_PASS` | *(required in SSE mode)* | Password for the OAuth consent page |
 | `CORS_ORIGIN` | `*` | Restrict to `https://claude.ai` in production |
+
+---
+
+## Documentation
+
+| Doc | Description |
+|---|---|
+| [docs/resolvers.md](docs/resolvers.md) | `tqnn_get` resolver system — logical namespaces, handler types, migration, custom handlers |
 
 ---
 
