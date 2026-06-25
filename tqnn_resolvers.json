@@ -1,0 +1,100 @@
+{
+  "_comment": "TQNN DMM Resolver Configuration — tqnn_resolvers.json",
+  "_version": "1.0.0",
+  "_docs": "Maps filereference URI schemes/prefixes to resolver handlers for tqnn_get.",
+  "resolvers": [
+    {
+      "scheme": "memory://",
+      "type": "memory",
+      "description": "In-memory namespace — metadata stored at write time via tqnn_store. Content is the stored pattern JSON.",
+      "handler": "memory"
+    },
+    {
+      "scheme": "records_",
+      "type": "local_jsonl",
+      "description": "Local JSONL data files — e.g. Lindisfarne M1 ingest. Filereference encodes filename and optional line/record.",
+      "handler": "local_jsonl",
+      "config": {
+        "base_path": "/data/lindisfarne-m1/",
+        "encoding": "utf8",
+        "max_fetch_bytes": 5242880
+      }
+    },
+    {
+      "scheme": "https://",
+      "type": "url",
+      "description": "HTTP/S hosted resource — fetches URL directly.",
+      "handler": "url",
+      "config": {
+        "timeout_ms": 8000,
+        "allow_redirect": true,
+        "max_fetch_bytes": 10485760
+      }
+    },
+    {
+      "scheme": "http://",
+      "type": "url",
+      "description": "HTTP hosted resource (non-TLS). Use HTTPS in production.",
+      "handler": "url",
+      "config": {
+        "timeout_ms": 8000,
+        "allow_redirect": true,
+        "max_fetch_bytes": 10485760
+      }
+    },
+    {
+      "scheme": "glacier://",
+      "type": "cold_storage",
+      "description": "Cold/archive storage — retrieval is async. Returns RETRIEVAL_PENDING with a ticket.",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_GLACIER_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": 4
+      }
+    },
+    {
+      "scheme": "webhook://",
+      "type": "developer_webhook",
+      "description": "Generic developer-defined webhook resolver. Developer registers their own endpoint.",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": null
+      }
+    },
+    {
+      "scheme": "s3://",
+      "type": "s3_compatible",
+      "description": "S3-compatible object storage (AWS S3, Cloudflare R2, MinIO etc).",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_S3_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": null
+      }
+    },
+    {
+      "scheme": "sharepoint://",
+      "type": "m365_sharepoint",
+      "description": "Microsoft 365 / SharePoint document library. Middleware handles MS Graph auth — DMM never sees credentials.",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_SHAREPOINT_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": null
+      }
+    }
+  ],
+  "default_on_no_match": "reject",
+  "fetch_options": {
+    "allow_zip": true,
+    "zip_threshold_bytes": 102400,
+    "max_inline_bytes": 1048576
+  }
+}
