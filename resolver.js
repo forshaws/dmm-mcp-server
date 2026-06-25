@@ -1,4 +1,4 @@
-// resolver.js — tqnn_get resolver module for TQNN DMM MCP Server
+// resolver.js — tqnn_get resolver module for TQNN DMM MCP Server.
 // TQNN MCP Server v1.4.0
 //
 // Loads tqnn_resolvers.json and dispatches tqnn_get operations to the
@@ -91,15 +91,45 @@ function normaliseRef(ref) {
 }
 
 /**
+ * Detect whether a filereference uses a logical namespace prefix.
+ * Logical prefixes follow [a-zA-Z0-9]+_ e.g. records_, invoices_, contracts_
+ * Anything else (https://, C:\, \\server\, /mnt/) is non-logical.
+ * @param {string} ref
+ * @returns {boolean}
+ */
+function isLogicalPrefix(ref) {
+  return /^[a-zA-Z0-9]+_/.test(ref);
+}
+
+/**
  * Find the resolver config entry for a given filereference.
- * Matches on longest prefix first to avoid ambiguity.
+ *
+ * Resolution order:
+ *   1. Logical prefix ([a-zA-Z0-9]+_): match against resolver schemes, longest first.
+ *   2. Non-logical (URL, drive letter, UNC, mount point): use wildcard catch-all.
+ *   3. No match and no catch-all: return null.
+ *
  * @param {string} ref - Normalised filereference
  * @param {object[]} resolvers
  * @returns {object|null}
  */
 function matchResolver(ref, resolvers) {
-  const sorted = [...resolvers].sort((a, b) => b.scheme.length - a.scheme.length);
-  return sorted.find(r => ref.startsWith(r.scheme)) || null;
+  // Always check explicit named schemes first (longest match), regardless of logical/non-logical.
+  // This allows memory://, glacier://, or any developer-defined non-logical scheme
+  // to be explicitly handled without falling through to the * catch-all.
+  const named = [...resolvers]
+    .filter(r => r.scheme !== '*')
+    .sort((a, b) => b.scheme.length - a.scheme.length);
+  const explicit = named.find(r => ref.startsWith(r.scheme));
+  if (explicit) return explicit;
+
+  if (isLogicalPrefix(ref)) {
+    // Logical prefix with no explicit resolver — no match
+    return null;
+  } else {
+    // Non-logical reference — route to * catch-all if configured
+    return resolvers.find(r => r.scheme === '*') || null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,16 +533,19 @@ async function resolverDispatch(filereference, operation) {
   const resolver = matchResolver(ref, cfg.resolvers);
 
   if (!resolver) {
-    if (cfg.default_on_no_match === 'reject') {
-      return {
-        status: 'NO_RESOLVER',
-        filereference: ref,
-        message: `No resolver configured for this filereference scheme. Check tqnn_resolvers.json.`,
-        hint: 'Add a matching scheme entry to tqnn_resolvers.json or implement a webhook handler.'
-      };
-    }
-    // default_on_no_match === 'passthrough' — future extension
-    return { status: 'NO_RESOLVER', filereference: ref };
+    const logical = isLogicalPrefix(ref);
+    const ns = ref.split('_')[0] + '_';
+    return {
+      status: 'NO_RESOLVER',
+      filereference: ref,
+      is_logical_prefix: logical,
+      message: logical
+        ? `No resolver configured for logical namespace "${ns}". Add a matching scheme entry to tqnn_resolvers.json.`
+        : `Non-logical filereference (URL, drive letter, UNC, mount point) with no catch-all webhook configured. Set RESOLVER_DEFAULT_WEBHOOK_URL in .env and add a "*" scheme entry to tqnn_resolvers.json.`,
+      hint: logical
+        ? `Add { "scheme": "${ns}", "handler": "local_jsonl" or "webhook", "config": {...} } to tqnn_resolvers.json.`
+        : 'Add a "*" catch-all entry to tqnn_resolvers.json with handler: "webhook" and set RESOLVER_DEFAULT_WEBHOOK_URL in .env.'
+    };
   }
 
   process.stderr.write(`[tqnn-resolver] ${operation.toUpperCase()} "${ref}" → handler: ${resolver.handler} (${resolver.type})\n`);

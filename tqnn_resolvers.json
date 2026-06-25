@@ -1,51 +1,89 @@
 {
-  "_comment": "TQNN DMM Resolver Configuration — tqnn_resolvers.json",
-  "_version": "1.0.0",
-  "_docs": "Maps filereference URI schemes/prefixes to resolver handlers for tqnn_get.",
+  "_comment": "TQNN DMM Resolver Configuration — tqnn_resolvers.json v1.1.0",
+  "_docs": "Maps filereference logical namespace prefixes to storage handlers for tqnn_get.",
+  "_prefix_rules": {
+    "logical": "Prefixes matching [a-zA-Z0-9]+_ are logical namespaces — resolved via this file.",
+    "non_logical": "Anything else (https://, C:\\, \\\\server\\, /mnt/) is a non-logical reference — routed to the '*' catch-all webhook. Your middleware handles translation.",
+    "migration": "When storage moves, update the config here. DMM filereferences never change."
+  },
   "resolvers": [
     {
-      "scheme": "memory://",
-      "type": "memory",
-      "description": "In-memory namespace — metadata stored at write time via tqnn_store. Content is the stored pattern JSON.",
-      "handler": "memory"
-    },
-    {
+      "_use_case": "Local JSONL dataset — e.g. Lindisfarne M1 ingested line by line",
+      "_example_ref": "records_0002.jsonl::line5975::REC-00025975::",
       "scheme": "records_",
       "type": "local_jsonl",
-      "description": "Local JSONL data files — e.g. Lindisfarne M1 ingest. Filereference encodes filename and optional line/record.",
       "handler": "local_jsonl",
       "config": {
-        "base_path": "/data/lindisfarne-m1/",
+        "base_path": "/home/tqnn/data/",
         "encoding": "utf8",
         "max_fetch_bytes": 5242880
       }
     },
     {
-      "scheme": "https://",
-      "type": "url",
-      "description": "HTTP/S hosted resource — fetches URL directly.",
-      "handler": "url",
+      "_use_case": "Invoice documents stored in a local directory",
+      "_example_ref": "invoices_2024::INV-00293::acme-corp::",
+      "scheme": "invoices_",
+      "type": "local_jsonl",
+      "handler": "local_jsonl",
       "config": {
-        "timeout_ms": 8000,
-        "allow_redirect": true,
-        "max_fetch_bytes": 10485760
+        "base_path": "/home/tqnn/data/invoices/",
+        "encoding": "utf8",
+        "max_fetch_bytes": 5242880
       }
     },
     {
-      "scheme": "http://",
-      "type": "url",
-      "description": "HTTP hosted resource (non-TLS). Use HTTPS in production.",
-      "handler": "url",
+      "_use_case": "Contracts in S3-compatible storage — middleware handles S3 auth and fetch",
+      "_example_ref": "contracts_acme::CLT-00042::v3::",
+      "scheme": "contracts_",
+      "type": "s3_via_webhook",
+      "handler": "webhook",
       "config": {
-        "timeout_ms": 8000,
-        "allow_redirect": true,
-        "max_fetch_bytes": 10485760
+        "webhook_url": "ENV:RESOLVER_CONTRACTS_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": null
       }
     },
     {
+      "_use_case": "SharePoint / M365 documents — middleware uses MS Graph, DMM never sees credentials",
+      "_example_ref": "sharepoint_legal::DOC-00881::compliance-2024::",
+      "scheme": "sharepoint_",
+      "type": "m365_via_webhook",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_SHAREPOINT_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": null
+      }
+    },
+    {
+      "_use_case": "Cold/archive storage — retrieval is async, returns ticket",
+      "_example_ref": "archive_2023::batch-003::REC-00041234::",
+      "scheme": "archive_",
+      "type": "cold_storage",
+      "handler": "webhook",
+      "config": {
+        "webhook_url": "ENV:RESOLVER_ARCHIVE_WEBHOOK_URL",
+        "auth_header": "X-TQNN-Secret",
+        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
+        "estimated_hours": 4
+      }
+    },
+    {
+      "_use_case": "In-memory namespace — written by tqnn_store during session, cleared on restart",
+      "_example_ref": "memory://claude/session/2026-06-25::",
+      "_note": "memory:// is non-logical but explicit — takes priority over * catch-all",
+      "scheme": "memory://",
+      "type": "memory",
+      "handler": "memory"
+    },
+    {
+      "_use_case": "AWS Glacier or cold archive — async retrieval, returns ticket",
+      "_example_ref": "glacier://archive/2024/Q1/batch-003::",
+      "_note": "glacier:// is non-logical but explicit — takes priority over * catch-all",
       "scheme": "glacier://",
       "type": "cold_storage",
-      "description": "Cold/archive storage — retrieval is async. Returns RETRIEVAL_PENDING with a ticket.",
       "handler": "webhook",
       "config": {
         "webhook_url": "ENV:RESOLVER_GLACIER_WEBHOOK_URL",
@@ -55,46 +93,30 @@
       }
     },
     {
-      "scheme": "webhook://",
-      "type": "developer_webhook",
-      "description": "Generic developer-defined webhook resolver. Developer registers their own endpoint.",
+      "_use_case": "Catch-all for non-logical refs: https://, C:\\, \\\\server\\, /mnt/ etc.",
+      "_example_ref": "https://s3.amazonaws.com/old-bucket/report.pdf::",
+      "_behaviour": "Full filereference passed as-is to middleware. Middleware handles URL rewriting, drive mapping, SMB resolution, bucket migration etc. DMM filereferences never change.",
+      "scheme": "*",
+      "type": "passthrough",
       "handler": "webhook",
       "config": {
-        "webhook_url": "ENV:RESOLVER_WEBHOOK_URL",
-        "auth_header": "X-TQNN-Secret",
-        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
-        "estimated_hours": null
-      }
-    },
-    {
-      "scheme": "s3://",
-      "type": "s3_compatible",
-      "description": "S3-compatible object storage (AWS S3, Cloudflare R2, MinIO etc).",
-      "handler": "webhook",
-      "config": {
-        "webhook_url": "ENV:RESOLVER_S3_WEBHOOK_URL",
-        "auth_header": "X-TQNN-Secret",
-        "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
-        "estimated_hours": null
-      }
-    },
-    {
-      "scheme": "sharepoint://",
-      "type": "m365_sharepoint",
-      "description": "Microsoft 365 / SharePoint document library. Middleware handles MS Graph auth — DMM never sees credentials.",
-      "handler": "webhook",
-      "config": {
-        "webhook_url": "ENV:RESOLVER_SHAREPOINT_WEBHOOK_URL",
+        "webhook_url": "ENV:RESOLVER_DEFAULT_WEBHOOK_URL",
         "auth_header": "X-TQNN-Secret",
         "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
         "estimated_hours": null
       }
     }
   ],
-  "default_on_no_match": "reject",
   "fetch_options": {
     "allow_zip": true,
     "zip_threshold_bytes": 102400,
     "max_inline_bytes": 1048576
+  },
+  "_env_vars": {
+    "RESOLVER_CONTRACTS_WEBHOOK_URL": "Webhook endpoint for contracts_ namespace",
+    "RESOLVER_SHAREPOINT_WEBHOOK_URL": "Webhook endpoint for sharepoint_ namespace",
+    "RESOLVER_ARCHIVE_WEBHOOK_URL": "Webhook endpoint for archive_ cold storage",
+    "RESOLVER_DEFAULT_WEBHOOK_URL": "Catch-all webhook for non-logical filereferences",
+    "RESOLVER_WEBHOOK_SECRET": "Shared secret sent in X-TQNN-Secret header to all webhooks"
   }
 }
