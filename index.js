@@ -78,13 +78,19 @@ const client = new TQNNClient({
 });
 
 // ── MCP Server ─────────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: 'tqnn-dmm',
-  version: '1.4.0'
-});
+// A fresh McpServer instance must be created per connection — the SDK forbids
+// connecting one Server/Protocol instance to more than one transport at a time
+// ("Already connected to a transport"). stdio mode only ever opens one
+// connection, but SSE mode can see many (client reconnects, multiple clients,
+// idle timeouts), so we wrap construction + tool registration in a factory.
+function createMcpServer() {
+  const server = new McpServer({
+    name: 'tqnn-dmm',
+    version: '1.4.0'
+  });
 
-// ── Tool: tqnn_status ─────────────────────────────────────────────────────────
-server.tool(
+  // ── Tool: tqnn_status ───────────────────────────────────────────────────────
+  server.tool(
   'tqnn_status',
   'Check TQNN DMM connectivity and confirm the associative memory layer is reachable. Call this at session start to self-orient.',
   {},
@@ -334,6 +340,9 @@ server.tool(
   }
 );
 
+  return server;
+}
+
 // ── Transport ──────────────────────────────────────────────────────────────────
 async function startServer() {
   if (CONFIG.mode === 'sse') {
@@ -345,6 +354,7 @@ async function startServer() {
 
 // ── stdio mode ─────────────────────────────────────────────────────────────────
 async function startStdio() {
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write('[tqnn-mcp] Running in stdio mode. Ready for Claude Code.\n');
@@ -378,7 +388,7 @@ async function startSSE() {
     adminPass:  CONFIG.oauthPass,
   });
 
-  const transports = new Map(); // sessionId → SSEServerTransport
+  const sessions = new Map(); // sessionId → { transport, mcpServer }
 
   const httpServer = http.createServer(async (req, res) => {
     // ── CORS ──────────────────────────────────────────────────────────────────
@@ -497,14 +507,16 @@ async function startSSE() {
 
       process.stderr.write(`[tqnn-mcp] New SSE connection (client: ${authResult.client_id}) from ${req.socket.remoteAddress}\n`);
       const transport = new SSEServerTransport('/messages', res);
-      transports.set(transport.sessionId, transport);
+      const mcpServer = createMcpServer();
+      sessions.set(transport.sessionId, { transport, mcpServer });
 
       res.on('close', () => {
-        transports.delete(transport.sessionId);
+        sessions.delete(transport.sessionId);
+        mcpServer.close?.();
         process.stderr.write(`[tqnn-mcp] SSE connection closed (session ${transport.sessionId})\n`);
       });
 
-      await server.connect(transport);
+      await mcpServer.connect(transport);
       return;
     }
 
@@ -523,13 +535,14 @@ async function startSSE() {
       const { URL: NodeURL } = require('url');
       const urlObj    = new NodeURL(url, `http://localhost:${CONFIG.port}`);
       const sessionId = urlObj.searchParams.get('sessionId');
-      const transport = transports.get(sessionId);
+      const session   = sessions.get(sessionId);
 
-      if (!transport) {
+      if (!session) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `Session ${sessionId} not found` }));
         return;
       }
+      const { transport } = session;
 
       let body = '';
       req.on('data', chunk => { body += chunk; });
