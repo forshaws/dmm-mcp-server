@@ -51,6 +51,8 @@ const { TQNNClient } = require('./tqnn-client');
 const { similaritySearch, pqrHash, pqrHashReversed, tokenise } = require('./similarity');
 const { OAuthServer, readBody } = require('./oauth');
 const { resolverDispatch, registerMemory } = require('./resolver');
+const fs   = require('fs');
+const path = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
@@ -70,12 +72,68 @@ if (!CONFIG.apiKey || !CONFIG.apiSecret) {
   process.stderr.write('[tqnn-mcp] WARNING: TQNN_API_KEY or TQNN_API_SECRET not set\n');
 }
 
-const client = new TQNNClient({
-  baseUrl:   CONFIG.baseUrl,
-  apiKey:    CONFIG.apiKey,
-  apiSecret: CONFIG.apiSecret,
-  dataset:   CONFIG.dataset
-});
+// ── Per-employee DMM credential resolution ──────────────────────────────────────
+// tqnn_mcp_credentials.json maps an authenticated employee (username, from
+// oauth.js's validateToken) to their own DMM sub-credential pair — generated
+// via the appliance's ACL console (tqnn_acl_manager.php), NOT invented here.
+// Sending the right sub-credential means dataset whitelisting is enforced by
+// esec.php's tqnn_acl_gate() at the appliance itself — this file never
+// duplicates that logic, it just picks which credential pair to send.
+//
+// If the file is missing, or a given username has no specific entry, we fall
+// back to CONFIG.apiKey/apiSecret (the static .env pair) — so stdio mode
+// (Claude Code, no OAuth/no username) and any not-yet-migrated setup keep
+// working exactly as before.
+const CRED_FILE = path.join(__dirname, 'tqnn_mcp_credentials.json');
+let _credCache = null;
+let _credMtime = 0;
+
+function loadCredentials() {
+  try {
+    const stat = fs.statSync(CRED_FILE);
+    if (_credCache && stat.mtimeMs === _credMtime) return _credCache;
+    const raw = fs.readFileSync(CRED_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    _credCache = parsed && typeof parsed === 'object' ? parsed : null;
+    _credMtime = stat.mtimeMs;
+    return _credCache;
+  } catch {
+    return null; // file missing/unreadable/invalid — fall back to CONFIG default
+  }
+}
+
+const _clientCache = new Map(); // "apikey:apisecret" → TQNNClient (reused across calls)
+
+/**
+ * Resolve the TQNNClient to use for a given caller.
+ * @param {{ username?: string, client_id?: string }} [authResult] - from oauth.js validateToken(), absent in stdio mode
+ * @returns {TQNNClient}
+ */
+function getClientFor(authResult) {
+  const username = authResult && authResult.username;
+  const creds    = loadCredentials();
+
+  let pair = null;
+  if (creds && username && creds.users && creds.users[username]) {
+    pair = creds.users[username];
+  } else if (creds && creds.default) {
+    pair = creds.default;
+  }
+
+  const apiKey    = (pair && pair.sub_apikey)    || CONFIG.apiKey;
+  const apiSecret = (pair && pair.sub_apisecret) || CONFIG.apiSecret;
+
+  const cacheKey = `${apiKey}:${apiSecret}`;
+  if (!_clientCache.has(cacheKey)) {
+    _clientCache.set(cacheKey, new TQNNClient({
+      baseUrl:   CONFIG.baseUrl,
+      apiKey,
+      apiSecret,
+      dataset:   CONFIG.dataset
+    }));
+  }
+  return _clientCache.get(cacheKey);
+}
 
 // ── MCP Server ─────────────────────────────────────────────────────────────────
 // A fresh McpServer instance must be created per connection — the SDK forbids
@@ -83,11 +141,16 @@ const client = new TQNNClient({
 // ("Already connected to a transport"). stdio mode only ever opens one
 // connection, but SSE mode can see many (client reconnects, multiple clients,
 // idle timeouts), so we wrap construction + tool registration in a factory.
-function createMcpServer() {
+function createMcpServer(authResult) {
   const server = new McpServer({
     name: 'tqnn-dmm',
     version: '1.4.0'
   });
+
+  // Resolved once per connection (matches the per-connection McpServer factory
+  // pattern already used here) — every tool call on this connection uses the
+  // same employee-scoped DMM credential.
+  const client = getClientFor(authResult);
 
   // ── Tool: tqnn_status ───────────────────────────────────────────────────────
   server.tool(
@@ -505,9 +568,9 @@ async function startSSE() {
         return;
       }
 
-      process.stderr.write(`[tqnn-mcp] New SSE connection (client: ${authResult.client_id}) from ${req.socket.remoteAddress}\n`);
+      process.stderr.write(`[tqnn-mcp] New SSE connection (client: ${authResult.client_id}, user: ${authResult.username || 'n/a'}) from ${req.socket.remoteAddress}\n`);
       const transport = new SSEServerTransport('/messages', res);
-      const mcpServer = createMcpServer();
+      const mcpServer = createMcpServer(authResult);
       sessions.set(transport.sessionId, { transport, mcpServer });
 
       res.on('close', () => {

@@ -1,0 +1,10 @@
+{
+  "_comment": "TQNN MCP Server — per-employee login accounts. Checked at the OAuth consent screen AND on every subsequent MCP request (live revocation). To revoke someone immediately, set their status to \"disabled\" — takes effect on their very next request, no restart needed. Generate password_hash values with: node tqnn_mcp_hash_password.js <password>",
+  "users": {
+    "example_user": {
+      "label": "Example User — replace or remove this entry",
+      "password_hash": "REPLACE_WITH_OUTPUT_OF_tqnn_mcp_hash_password.js",
+      "status": "active"
+    }
+  }
+}
