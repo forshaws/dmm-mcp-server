@@ -20,6 +20,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs     = require('fs');
+const path   = require('path');
 const { URL } = require('url');
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -66,6 +68,80 @@ function hmacSign(secret, data) {
 }
 
 function now() { return Math.floor(Date.now() / 1000); }
+
+// ── Per-employee users file (tqnn_mcp_users.json) ───────────────────────────────
+// Replaces the single shared admin login when present. Each user has their own
+// username/password and an active/disabled status that is checked LIVE on every
+// single MCP request (not just at login) — disabling a user here revokes their
+// access immediately, even if they're holding an unexpired token.
+//
+// If this file is absent, oauth.js falls back to the legacy single admin
+// user/pass from .env (TQNN_OAUTH_USER / TQNN_OAUTH_PASS) — nothing breaks
+// on a fresh install or before you've set up per-employee accounts.
+const USERS_FILE = path.join(__dirname, 'tqnn_mcp_users.json');
+let _usersCache  = null;
+let _usersMtime  = 0;
+
+function loadUsers() {
+  try {
+    const stat = fs.statSync(USERS_FILE);
+    if (_usersCache && stat.mtimeMs === _usersMtime) return _usersCache;
+    const raw = fs.readFileSync(USERS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    _usersCache = (parsed && typeof parsed.users === 'object') ? parsed.users : {};
+    _usersMtime = stat.mtimeMs;
+    return _usersCache;
+  } catch {
+    // File missing, unreadable, or invalid JSON — treat as "no per-user accounts configured"
+    return null;
+  }
+}
+
+/**
+ * Is this username currently allowed to authenticate / stay authenticated?
+ * Re-reads tqnn_mcp_users.json (cheap — cached by mtime) so edits to the file
+ * take effect on the very next check, no restart required.
+ * @param {string} username
+ * @returns {boolean}
+ */
+function isUserActive(username) {
+  const users = loadUsers();
+  if (!users) return true; // no per-user file — legacy single-admin mode, always "active"
+  const entry = users[username];
+  return !!entry && entry.status === 'active';
+}
+
+/**
+ * Hash a password for storage in tqnn_mcp_users.json.
+ * Uses scrypt (Node built-in, no extra dependency) — format: "salt_hex:hash_hex".
+ * @param {string} password
+ * @returns {string}
+ */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+/**
+ * Verify a plaintext password against a "salt_hex:hash_hex" stored value.
+ * Constant-time comparison.
+ * @param {string} password
+ * @param {string} stored
+ * @returns {boolean}
+ */
+function verifyPassword(password, stored) {
+  if (!stored || typeof stored !== 'string' || !stored.includes(':')) return false;
+  const [saltHex, hashHex] = stored.split(':');
+  try {
+    const computed = crypto.scryptSync(password, saltHex, 64);
+    const expected = Buffer.from(hashHex, 'hex');
+    if (computed.length !== expected.length) return false;
+    return crypto.timingSafeEqual(computed, expected);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Verify S256 PKCE.
@@ -240,7 +316,8 @@ class OAuthServer {
     }
 
     // Validate credentials
-    if (!this._checkCredentials(username, password)) {
+    const authenticatedUser = this._checkCredentials(username, password);
+    if (!authenticatedUser) {
       const html = this._renderAuthForm(state, '', pending.scope, 'Invalid credentials. Please try again.');
       return { action: 'render_form', html };
     }
@@ -253,6 +330,7 @@ class OAuthServer {
       code_challenge: pending.code_challenge,
       scope:          pending.scope,
       resource:       pending.resource,
+      username:       authenticatedUser,
       created_at:     now()
     });
     pendingAuths.delete(state);
@@ -306,10 +384,10 @@ class OAuthServer {
     const client = clients.get(client_id);
     if (!client) return { error: 'invalid_client' };
 
-    const accessToken  = this._issueAccessToken(client_id, stored.scope, stored.resource);
-    const refreshToken = this._issueRefreshToken(client_id, stored.scope, stored.resource);
+    const accessToken  = this._issueAccessToken(client_id, stored.scope, stored.resource, stored.username);
+    const refreshToken = this._issueRefreshToken(client_id, stored.scope, stored.resource, stored.username);
 
-    process.stderr.write(`[tqnn-oauth] Token issued for client ${client_id}\n`);
+    process.stderr.write(`[tqnn-oauth] Token issued for client ${client_id} (user: ${stored.username || 'n/a'})\n`);
     return {
       access_token:  accessToken,
       token_type:    'Bearer',
@@ -332,10 +410,17 @@ class OAuthServer {
     if (stored.client_id !== client_id) {
       return { error: 'invalid_client' };
     }
+    // Live revocation check — reject refresh if the employee was disabled
+    // since this refresh token was issued.
+    if (stored.username && !isUserActive(stored.username)) {
+      refreshTokens.delete(refresh_token);
+      return { error: 'invalid_grant', error_description: 'User account disabled' };
+    }
+
     // Rotate refresh token
     refreshTokens.delete(refresh_token);
-    const newAccess  = this._issueAccessToken(client_id, stored.scope, stored.resource);
-    const newRefresh = this._issueRefreshToken(client_id, stored.scope, stored.resource);
+    const newAccess  = this._issueAccessToken(client_id, stored.scope, stored.resource, stored.username);
+    const newRefresh = this._issueRefreshToken(client_id, stored.scope, stored.resource, stored.username);
     return {
       access_token:  newAccess,
       token_type:    'Bearer',
@@ -346,16 +431,16 @@ class OAuthServer {
   }
 
   // ── Token issuance ──────────────────────────────────────────────────────────
-  _issueAccessToken(clientId, scope, resource) {
+  _issueAccessToken(clientId, scope, resource, username) {
     const payload = { sub: clientId, scope, resource, iat: now(), exp: now() + ACCESS_TOKEN_TTL, jti: randomToken(16) };
     const token = this._signPayload(payload);
-    accessTokens.set(token, { client_id: clientId, scope, resource, created_at: now() });
+    accessTokens.set(token, { client_id: clientId, scope, resource, username, created_at: now() });
     return token;
   }
 
-  _issueRefreshToken(clientId, scope, resource) {
+  _issueRefreshToken(clientId, scope, resource, username) {
     const token = randomToken(40);
-    refreshTokens.set(token, { client_id: clientId, scope, resource, created_at: now() });
+    refreshTokens.set(token, { client_id: clientId, scope, resource, username, created_at: now() });
     return token;
   }
 
@@ -369,8 +454,16 @@ class OAuthServer {
   // ── Token validation (called per MCP request) ───────────────────────────────
   /**
    * Validate a Bearer token from Authorization header.
+   *
+   * Runs on EVERY MCP request (both /sse and /messages), so this is also
+   * the immediate-revocation checkpoint: if the employee this token belongs
+   * to has been disabled in tqnn_mcp_users.json since the token was issued,
+   * the token is rejected here and then actively purged — no waiting for
+   * expiry, no restart needed. Edits to tqnn_mcp_users.json take effect on
+   * the very next request from that employee.
+   *
    * @param {string} authHeader - Value of Authorization header
-   * @returns {{ valid: boolean, client_id?: string, scope?: string }}
+   * @returns {{ valid: boolean, client_id?: string, scope?: string, username?: string }}
    */
   validateToken(authHeader) {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -393,16 +486,55 @@ class OAuthServer {
       }
     } catch { return { valid: false }; }
 
-    return { valid: true, client_id: stored.client_id, scope: stored.scope };
+    // Live revocation check — disabling a user in tqnn_mcp_users.json kills
+    // this token immediately, even though the signature/expiry checks above
+    // still pass. Skipped for legacy-mode tokens (no username attached).
+    if (stored.username && !isUserActive(stored.username)) {
+      accessTokens.delete(token);
+      for (const [rtoken, rstored] of refreshTokens) {
+        if (rstored.client_id === stored.client_id && rstored.username === stored.username) {
+          refreshTokens.delete(rtoken);
+        }
+      }
+      return { valid: false, reason: 'user_disabled' };
+    }
+
+    const client = clients.get(stored.client_id);
+    return {
+      valid:       true,
+      client_id:   stored.client_id,
+      client_name: client ? client.client_name : undefined,
+      scope:       stored.scope,
+      username:    stored.username,
+    };
   }
 
   // ── Credential check ────────────────────────────────────────────────────────
+  // Checks tqnn_mcp_users.json first (per-employee accounts). If that file
+  // isn't present at all, falls back to the single legacy admin login from
+  // .env — so this is a non-breaking change for anyone who hasn't set up
+  // per-employee accounts yet.
+  // Returns the authenticated username on success (for per-employee mode,
+  // this is their own username; for legacy mode, this.adminUser), or null
+  // on failure.
   _checkCredentials(username, password) {
-    if (!username || !password) return false;
+    if (!username || !password) return null;
+
+    const users = loadUsers();
+
+    if (users) {
+      const entry = users[username];
+      if (!entry) return null;
+      if (entry.status !== 'active') return null;
+      if (!verifyPassword(password, entry.password_hash || '')) return null;
+      return username;
+    }
+
+    // Legacy fallback — single shared admin login
     const passHash = crypto.createHash('sha256').update(password, 'utf8').digest('hex');
     const userOk = crypto.timingSafeEqual(Buffer.from(this.adminUser.padEnd(64)), Buffer.from(username.padEnd(64)));
     const passOk = crypto.timingSafeEqual(Buffer.from(this.adminPassHash), Buffer.from(passHash));
-    return userOk && passOk;
+    return (userOk && passOk) ? this.adminUser : null;
   }
 
   // ── HTML consent form ────────────────────────────────────────────────────────
@@ -523,4 +655,4 @@ function escHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
-module.exports = { OAuthServer, readBody };
+module.exports = { OAuthServer, readBody, hashPassword, verifyPassword };
