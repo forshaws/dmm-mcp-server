@@ -65,6 +65,9 @@ class TQNNClient {
   /**
    * Lightweight connectivity ping using a known-harmless token.
    * Uses self-salting PQR scheme (V1.3.0+) — matches tqnnToken16() in similarity.js.
+   * Sends `dataset` (this.dataset) the same way searchDoc()/storeDoc() do —
+   * required so tqnn_acl_gate() has a dataset to check under sub-credentials.
+   * Owner credentials aren't affected (Stage 2 bypasses the check for them).
    * @returns {Promise<ApiResponse>}
    */
   async ping() {
@@ -73,7 +76,10 @@ class TQNNClient {
     const h1       = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
     const padded   = (input + h1).slice(0, 16);
     const pingHash = crypto.createHash('sha256').update(padded, 'utf8').digest('hex').slice(0, 16);
-    return this._post('/v1/searchDoc', { pattern: pingHash });
+    return this._post('/v1/searchDoc', {
+      pattern: pingHash,
+      ...(this.dataset ? { dataset: this.dataset } : {})
+    });
   }
 
   /*
