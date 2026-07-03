@@ -122,14 +122,20 @@ function getClientFor(authResult) {
 
   const apiKey    = (pair && pair.sub_apikey)    || CONFIG.apiKey;
   const apiSecret = (pair && pair.sub_apisecret) || CONFIG.apiSecret;
+  // Each credential entry can optionally declare its own default dataset —
+  // used for ping() and any call that doesn't pass dataset explicitly.
+  // Falls back to CONFIG.dataset (.env TQNN_DATASET) if not set. This
+  // matters because a sub-credential's ACL whitelist may not include
+  // CONFIG.dataset at all, in which case ping() would otherwise 403.
+  const dataset   = (pair && pair.dataset) || CONFIG.dataset;
 
-  const cacheKey = `${apiKey}:${apiSecret}`;
+  const cacheKey = `${apiKey}:${apiSecret}:${dataset}`;
   if (!_clientCache.has(cacheKey)) {
     _clientCache.set(cacheKey, new TQNNClient({
       baseUrl:   CONFIG.baseUrl,
       apiKey,
       apiSecret,
-      dataset:   CONFIG.dataset
+      dataset
     }));
   }
   return _clientCache.get(cacheKey);
