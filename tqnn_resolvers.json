@@ -1,5 +1,5 @@
 {
-  "_comment": "TQNN DMM Resolver Configuration — tqnn_resolvers.json v1.1.0",
+  "_comment": "TQNN DMM Resolver Configuration — tqnn_resolvers.json v1.1.1",
   "_docs": "Maps filereference logical namespace prefixes to storage handlers for tqnn_get.",
   "_prefix_rules": {
     "logical": "Prefixes matching [a-zA-Z0-9]+_ are logical namespaces — resolved via this file.",
@@ -90,6 +90,17 @@
         "auth_header": "X-TQNN-Secret",
         "auth_value": "ENV:RESOLVER_WEBHOOK_SECRET",
         "estimated_hours": 4
+      }
+    },
+    {
+      "_use_case": "Lindisfarne physical-address demo — byte-offset fetch via storage_target fetch service, no full-file read",
+      "_example_ref": "lindisfarne_blob_001.bin::off18446744::len2048::",
+      "scheme": "lindisfarne_blob_",
+      "type": "local_blob",
+      "handler": "local_blob",
+      "config": {
+        "target_host": "127.0.0.1",
+        "target_port": 9600
       }
     },
     {

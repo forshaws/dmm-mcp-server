@@ -12,6 +12,8 @@
 // Handlers:
 //   memory      — in-memory namespace (filereferences stored via tqnn_store)
 //   local_jsonl — local JSONL data files (e.g. Lindisfarne M1)
+//   local_blob  — byte-offset fetch against a blob file via a storage_target
+//                 fetch service (demo: deterministic physical-address retrieval)
 //   url         — HTTP/S hosted resources
 //   webhook     — developer-defined endpoint (glacier, S3, SharePoint, generic)
 
@@ -311,6 +313,105 @@ async function handleLocalJsonl(ref, operation, resolverConfig) {
   return unknownOperation(operation);
 }
 
+// ── local_blob handler ──────────────────────────────────────────────────────
+//
+// Byte-offset fetch against a blob file, via a standalone storage_target
+// fetch service reached over TCP. Deliberately kept separate from
+// local_jsonl (which reads a whole file / line locally in-process): the
+// point of this handler is to time resolution and physical fetch as two
+// distinct hops, matching the "resolve to a coordinate, then fetch from
+// physical media" story rather than an in-process file read.
+//
+// Filereference format: <blobfile>::off<N>::len<N>::
+//   e.g. lindisfarne_blob_001.bin::off18446744::len2048::
+
+const net = require('net');
+
+async function fetchFromStorageTarget(host, portNum, filename, offset, length) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port: portNum }, () => {
+      socket.write(JSON.stringify({ filename, offset, length }) + '\n');
+    });
+    let chunks = [];
+    socket.on('data', (d) => chunks.push(d));
+    socket.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        resolve(body);
+      } catch (e) {
+        reject(new Error(`storage_target response parse error: ${e.message}`));
+      }
+    });
+    socket.on('error', reject);
+    socket.setTimeout(10000, () => {
+      socket.destroy();
+      reject(new Error('storage_target connection timed out'));
+    });
+  });
+}
+
+async function handleLocalBlob(ref, operation, resolverConfig) {
+  const cfg = resolverConfig.config || {};
+  const targetHost = cfg.target_host || '127.0.0.1';
+  const targetPort = cfg.target_port || 9600;
+
+  const clean = normaliseRef(ref).replace(/::$/, '');
+  const parts = clean.split('::');
+  const filename = parts[0];
+  const offMatch = (parts[1] || '').match(/^off(\d+)$/);
+  const lenMatch = (parts[2] || '').match(/^len(\d+)$/);
+
+  if (!offMatch || !lenMatch) {
+    return {
+      status: 'ERROR',
+      resolver: 'local_blob',
+      filereference: ref,
+      message: 'Expected filereference format <file>::offN::lenN::'
+    };
+  }
+  const offset = parseInt(offMatch[1], 10);
+  const length = parseInt(lenMatch[1], 10);
+
+  if (operation === 'ping') {
+    try {
+      const result = await fetchFromStorageTarget(targetHost, targetPort, filename, 0, 0);
+      return { status: result.status === 'ERROR' ? 'NOT_FOUND' : 'AVAILABLE', resolver: 'local_blob', filereference: ref };
+    } catch (e) {
+      return { status: 'UNREACHABLE', resolver: 'local_blob', filereference: ref, error: e.message };
+    }
+  }
+
+  if (operation === 'info') {
+    return { status: 'AVAILABLE', resolver: 'local_blob', filereference: ref, filename, offset, length };
+  }
+
+  if (operation === 'fetch') {
+    const resolveEnd = process.hrtime.bigint();
+    try {
+      const result = await fetchFromStorageTarget(targetHost, targetPort, filename, offset, length);
+      const fetchEnd = process.hrtime.bigint();
+      if (result.status !== 'OK') {
+        return { status: result.status || 'ERROR', resolver: 'local_blob', filereference: ref, message: result.message || 'storage_target returned an error' };
+      }
+      return {
+        status: 'OK',
+        resolver: 'local_blob',
+        filereference: ref,
+        filename,
+        offset,
+        length,
+        fetch_ms: Number(fetchEnd - resolveEnd) / 1e6,
+        encoding: 'base64',
+        content_base64: result.content_base64
+      };
+    } catch (e) {
+      return { status: 'UNREACHABLE', resolver: 'local_blob', filereference: ref, error: e.message };
+    }
+  }
+
+  return unknownOperation(operation);
+}
+
 // ── url handler ─────────────────────────────────────────────────────────────
 
 async function handleUrl(ref, operation, resolverConfig) {
@@ -554,6 +655,7 @@ async function resolverDispatch(filereference, operation) {
     switch (resolver.handler) {
       case 'memory':      return await handleMemory(ref, operation);
       case 'local_jsonl': return await handleLocalJsonl(ref, operation, resolver);
+      case 'local_blob':  return await handleLocalBlob(ref, operation, resolver);
       case 'url':         return await handleUrl(ref, operation, resolver);
       case 'webhook':     return await handleWebhook(ref, operation, resolver);
       default:
