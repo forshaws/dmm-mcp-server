@@ -57,6 +57,31 @@ Drop this file in the `dmm-mcp-server` root directory alongside `index.js`. The 
     },
 
     {
+      "_use_case": "Physical-address demo — byte-offset fetch via a separate storage_target process, not an in-process file read",
+      "_example_ref": "lindisfarne_blob_001.bin::off18446744::len2048::",
+      "scheme": "lindisfarne_blob_",
+      "type": "local_blob",
+      "handler": "local_blob",
+      "config": {
+        "target_host": "127.0.0.1",
+        "target_port": 9600
+      }
+    },
+
+    {
+      "_use_case": "Raw LBA block storage demo — true 4KiB sector-addressed fetch against a loop-device-backed drive, no filesystem at all",
+      "_example_ref": "sn655_pool_001::lba1380::sectors1::",
+      "scheme": "sn655_pool_",
+      "type": "local_lba",
+      "handler": "local_lba",
+      "config": {
+        "target_host": "127.0.0.1",
+        "target_port": 9600,
+        "sector_size": 4096
+      }
+    },
+
+    {
       "_use_case": "Documents in S3 — middleware handles auth, DMM never sees credentials",
       "_example_ref": "contracts_acme::CLT-00042::v3::",
       "scheme": "contracts_",
@@ -172,6 +197,62 @@ records_0002.jsonl::line5975::REC-00025975::
 
 ---
 
+### `local_blob`
+
+Byte-offset fetch against a blob file, via a standalone `storage_target.py` process reached over TCP — deliberately kept separate from `local_jsonl`'s in-process file read. The point is timing resolution and physical fetch as two distinct hops, and demonstrating deterministic physical-address retrieval rather than a full-file read.
+
+**Filereference format:**
+```
+lindisfarne_blob_001.bin::off18446744::len2048::
+│                        │              │
+│                        │              └─ byte length to read
+│                        └─ byte offset to seek to
+└─ blob filename — resolved against storage_target's own base path
+```
+
+**Config:**
+
+| Key | Description |
+|---|---|
+| `target_host` | Host running `storage_target.py`. Almost always `127.0.0.1` — this is a raw file-read primitive and has no business being reachable off-box. |
+| `target_port` | Port `storage_target.py` is listening on. |
+
+**Requires `storage_target.py` running** and reachable at `target_host:target_port` before any `local_blob` fetch will succeed. `resolver.js` does not start this process itself.
+
+**Migration:** blob files can be copied to a new host/directory freely — update `storage_target.py`'s base path and `target_host`/`target_port` if it moves. Filereferences in DMM do not change, since the offset/length coordinates are relative to the blob file's own contents, not any absolute filesystem path.
+
+---
+
+### `local_lba`
+
+The raw-hardware evolution of `local_blob`: instead of a filename + byte offset inside it, the coordinate is a true Logical Block Address and sector count, read directly off an unformatted block device — no filesystem, no VFS, matching how enterprise NVMe media (e.g. a WD Ultrastar DC SN655) actually addresses storage. Also served by `storage_target.py`, over the same TCP-socket pattern as `local_blob`, just with a different request/response shape.
+
+**Filereference format:**
+```
+sn655_pool_001::lba1380::sectors1::
+│              │         │
+│              │         └─ number of whole 4KiB sectors to read
+│              └─ starting Logical Block Address
+└─ pool name — informational; routing happens via the scheme prefix, not this value
+```
+
+**Config:**
+
+| Key | Description |
+|---|---|
+| `target_host` | Host running `storage_target.py`. `127.0.0.1` only. |
+| `target_port` | Port `storage_target.py` is listening on. |
+| `sector_size` | Bytes per sector — `4096` for SN655-equivalent 4Kn addressing. Must match what the ingest pipeline actually packed onto the device. |
+
+**Requires:**
+- A raw block device presenting fixed-size sectors — a real NVMe drive, or a USB drive mapped through a loop device (`sudo losetup -b 4096 /dev/loop0 /dev/sdX`) for testbed use.
+- `storage_target.py` running, pointed at that device (`DMM_L2_DEVICE=/dev/loop0`), and reachable at `target_host:target_port`.
+- Records must actually be present on the device at the LBAs DMM has indexed — ingestion (see `tqnn_ingest_lba.py`) writes a local sector-aligned staging image first; that image then has to be `dd`'d onto the real device (`sudo dd if=staging.raw of=/dev/loop0 bs=4096`) before any fetch will return real data. Indexing into DMM and writing bytes to the physical device are two independent steps — completing one does not imply the other happened.
+
+**Migration:** unlike `local_jsonl`'s "point `base_path` somewhere else," migrating raw LBA storage means the *exact byte layout* has to move with it — `dd` the whole device image to the new drive, sector for sector. An LBA is a physical position, not a name; if the new device doesn't have byte-identical contents at that address, the fetch returns wrong (or garbage) data with no error, since `storage_target.py` has no way to know the bytes it read aren't what DMM expects.
+
+---
+
 ### `webhook`
 
 Forwards the request to a developer-controlled HTTP endpoint. The resolver POSTs a JSON payload and returns whatever the endpoint responds with. This is the correct handler for S3, SharePoint, SMB shares, databases, or any storage the MCP server cannot access directly.
@@ -243,6 +324,21 @@ Always `ping` or `info` before `fetch` for large or cold resources.
 
 ---
 
+## Timestamp round-trip and filereference parsing
+
+DMM appends a raw unix timestamp directly onto whatever filereference string it's given at write time — no separator of its own. This is why **every filereference you write should always end in `::`**: that trailing `::` is what lets the timestamp be stripped cleanly back off on read (DMM splits on the *last* `::` in the string and returns everything before it).
+
+The consequence worth knowing: what comes back from `searchDoc`/`multiSearchDoc` does **not reliably still have that trailing `::`**.
+
+- Written: `sn655_pool_001::lba1380::sectors1::` → timestamp appended → `sn655_pool_001::lba1380::sectors1::1720685440` → strip back to last `::` → returned as `sn655_pool_001::lba1380::sectors1` — **no trailing `::` at all.**
+- Written: `sn655_pool_001::lba1380::sectors1::fpd_2d29e514::` (with an fpd specialcode) → same append-and-strip → returned as `sn655_pool_001::lba1380::sectors1::fpd_2d29e514` — one `::` survives in the middle, purely because there was a segment after it.
+
+Both are correct, expected behaviour — not a bug in DMM or in either resolver. But it means **any parsing logic that assumes a filereference ends in `::` will intermittently fail**, and the failure is easy to miss during testing if your test records happen to all use `fpd` (which coincidentally leaves a `::` in the middle and can mask the problem).
+
+**The fix used by both `local_blob` and `local_lba`:** split the whole string on `::` and match each resulting token fully anchored (`/^off(\d+)$/`, `/^lba(\d+)$/`), then access by array position (`parts[1]`, `parts[2]`). This is completely indifferent to whether a trailing `::` survived — `"a::b::c".split('::')` and `"a::b::c::".split('::')` both put `b` at index 1 and `c` at index 2; the only difference is a harmless trailing empty string in the second case. If you write a custom handler (see below), parse this way, not with a whole-string regex anchored to the end.
+
+---
+
 ## Status codes
 
 | Status | Meaning |
@@ -268,6 +364,8 @@ Always `ping` or `info` before `fetch` for large or cold resources.
 ### Example: record ID → file lookup
 
 If you want filereferences like `patients_NHS::7857655619::` to map to individual JSON files by NHS number rather than JSONL line extraction, add a custom handler in `resolver.js`:
+
+*(This example already parses correctly per the [timestamp round-trip note](#timestamp-round-trip-and-filereference-parsing) above — it splits on `::` and accesses by position, so it works whether or not the trailing `::` survived the write/read round trip.)*
 
 ```javascript
 // In resolver.js — add to the switch(resolver.handler) block:
@@ -390,6 +488,8 @@ The filereference you write at ingest time is the retrieval contract. Follow the
 - For databases: `namespace_table::primary-key::`
 
 **Use NHS numbers, invoice IDs, contract IDs as record identifiers** — not names or emails. Structured identifiers index cleanly as single tokens. Email addresses containing `.` and `@` are stripped by the tokeniser and should be stored as a separate token if searchability is required.
+
+**Always terminate the filereference you write with `::`.** DMM appends a raw timestamp on write with no separator of its own, and strips back to the last `::` on read — a filereference that didn't end in `::` at write time can't be recovered cleanly. See [Timestamp round-trip and filereference parsing](#timestamp-round-trip-and-filereference-parsing) above for what this means for anyone reading filereferences back, including in a custom handler.
 
 ---
 
