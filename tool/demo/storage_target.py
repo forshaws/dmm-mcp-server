@@ -1,120 +1,126 @@
 #!/usr/bin/env python3
 """
-storage_target.py — deterministic byte-offset fetch service.
+storage_target.py — DMM Level 2 raw block fetcher (SN655-equivalent testbed)
 
-Plays the role of a storage target for the DMM local_blob resolver demo.
-Not a real storage protocol (no NVMe-oF, no iSCSI) — a small, deliberately
-plain TCP request/response service, understood only by resolver.js's
-handleLocalBlob on the other end. Its only job: given a filename, offset
-and length, open the file, seek to the offset, read exactly that many
-bytes, and return them. This is what makes "resolution" and "fetch" two
-genuinely separate, independently timed hops rather than one function call.
+Listens on a loopback-only TCP socket, accepts a JSON coordinate payload
+{"lba": N, "sectors": M}, and returns the raw bytes read directly from
+the block device node at that sector range.
 
-Wire format (newline-delimited JSON, one request per connection):
-  request:  {"filename": "lindisfarne_blob_001.bin", "offset": 18446744, "length": 2048}
-  response: {"status": "OK", "content_base64": "..."}
-         or {"status": "ERROR", "message": "..."}
-
-Run:
-  python3 storage_target.py --base-path /home/tqnn/data/lindisfarne_blobs --port 9600
+Hardening applied vs. the original sketch:
+  - Bound to 127.0.0.1 only — a raw block-read primitive has no business
+    being reachable off-box, even in testbed form.
+  - LBA/sectors validated as positive integers and bounds-checked against
+    actual device size before any seek happens.
+  - Optional O_DIRECT read path so latency telemetry measures the device,
+    not the Linux page cache.
 """
 
-import argparse
-import base64
-import json
-import os
 import socketserver
+import json
+import base64
+import os
 import sys
+
+SECTOR_SIZE = 4096
+DEVICE_PATH = os.environ.get("DMM_L2_DEVICE", "/dev/loop0")
+BIND_HOST = "127.0.0.1"   # loopback only — do not change without an ACL layer in front
+BIND_PORT = 9600
+USE_O_DIRECT = os.environ.get("DMM_L2_O_DIRECT", "0") == "1"
+
+
+def get_device_size(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return os.lseek(fd, 0, os.SEEK_END)
+    finally:
+        os.close(fd)
 
 
 class StorageTargetHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        base_path = self.server.base_path
-
         raw = self.rfile.readline()
         if not raw:
             return
 
         try:
-            req = json.loads(raw.decode('utf8'))
-            filename = req['filename']
-            offset = int(req['offset'])
-            length = int(req['length'])
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            self._respond({'status': 'ERROR', 'message': f'bad request: {e}'})
-            return
+            req = json.loads(raw.decode("utf8"))
 
-        # ping-style request (length 0): just confirm the file exists
-        if length == 0:
-            filepath = os.path.join(base_path, filename)
-            if os.path.isfile(filepath):
-                self._respond({'status': 'OK'})
-            else:
-                self._respond({'status': 'ERROR', 'message': 'file not found'})
-            return
+            # --- validation: this is a raw device, there is no filesystem
+            #     to stop a bad offset from seeking into someone else's data ---
+            if "lba" not in req or "sectors" not in req:
+                self._respond({"status": "ERROR", "message": "lba and sectors are required"})
+                return
 
-        filepath = os.path.realpath(os.path.join(base_path, filename))
-        if not filepath.startswith(os.path.realpath(base_path) + os.sep):
-            # refuse path traversal outside base_path
-            self._respond({'status': 'ERROR', 'message': 'invalid filename'})
-            return
+            lba = int(req["lba"])
+            sectors = int(req["sectors"])
 
-        if not os.path.isfile(filepath):
-            self._respond({'status': 'ERROR', 'message': 'file not found'})
-            return
+            if lba < 0 or sectors < 1:
+                self._respond({"status": "ERROR", "message": "lba must be >= 0 and sectors >= 1"})
+                return
 
-        try:
-            with open(filepath, 'rb') as f:
-                f.seek(offset)
-                data = f.read(length)
-        except OSError as e:
-            self._respond({'status': 'ERROR', 'message': str(e)})
-            return
+            device_size = get_device_size(DEVICE_PATH)
+            end_offset = (lba + sectors) * SECTOR_SIZE
+            if end_offset > device_size:
+                self._respond({
+                    "status": "ERROR",
+                    "message": f"requested range exceeds device size "
+                               f"({end_offset} > {device_size})",
+                })
+                return
 
-        if len(data) != length:
+            data = self._read_sectors(lba, sectors)
+
             self._respond({
-                'status': 'ERROR',
-                'message': f'short read: requested {length} bytes, got {len(data)} (offset past end of file?)'
+                "status": "OK",
+                "lba": lba,
+                "sectors": sectors,
+                "content_base64": base64.b64encode(data).decode("ascii"),
             })
-            return
 
-        self._respond({
-            'status': 'OK',
-            'content_base64': base64.b64encode(data).decode('ascii')
-        })
+        except (ValueError, TypeError) as e:
+            self._respond({"status": "ERROR", "message": f"malformed request: {e}"})
+        except Exception as e:
+            self._respond({"status": "ERROR", "message": str(e)})
+
+    def _read_sectors(self, lba, sectors):
+        length = sectors * SECTOR_SIZE
+        offset = lba * SECTOR_SIZE
+
+        if USE_O_DIRECT and hasattr(os, "O_DIRECT"):
+            # O_DIRECT requires the read buffer to be sector-aligned; since we
+            # always read in whole SECTOR_SIZE multiples this holds naturally.
+            fd = os.open(DEVICE_PATH, os.O_RDONLY | os.O_DIRECT)
+            try:
+                os.lseek(fd, offset, os.SEEK_SET)
+                return os.read(fd, length)
+            finally:
+                os.close(fd)
+        else:
+            with open(DEVICE_PATH, "rb") as f:
+                f.seek(offset)
+                return f.read(length)
 
     def _respond(self, payload):
-        self.wfile.write(json.dumps(payload).encode('utf8'))
-
-
-class StorageTargetServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-
-    def __init__(self, server_address, handler_cls, base_path):
-        self.base_path = base_path
-        super().__init__(server_address, handler_cls)
+        self.wfile.write(json.dumps(payload).encode("utf8"))
+        self.wfile.write(b"\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Deterministic byte-offset fetch service for DMM local_blob demo.')
-    parser.add_argument('--base-path', required=True, help='Directory containing the blob files')
-    parser.add_argument('--host', default='127.0.0.1', help='Bind host (default: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=9600, help='Bind port (default: 9600)')
-    args = parser.parse_args()
-
-    base_path = os.path.realpath(args.base_path)
-    if not os.path.isdir(base_path):
-        print(f'error: base path does not exist: {base_path}', file=sys.stderr)
-        sys.exit(1)
-
-    server = StorageTargetServer((args.host, args.port), StorageTargetHandler, base_path)
-    print(f'storage_target listening on {args.host}:{args.port}, base_path={base_path}')
+    print(f"[storage_target] device={DEVICE_PATH} o_direct={USE_O_DIRECT} "
+          f"bind={BIND_HOST}:{BIND_PORT}")
     try:
+        size = get_device_size(DEVICE_PATH)
+        print(f"[storage_target] device size: {size / (1024**3):.2f} GiB "
+              f"({size // SECTOR_SIZE} sectors)")
+    except OSError as e:
+        print(f"[storage_target] WARNING: could not open {DEVICE_PATH}: {e}", file=sys.stderr)
+        print("[storage_target] is the loop device set up? sudo losetup --block-size 4096 "
+              "/dev/loop0 <target>", file=sys.stderr)
+
+    with socketserver.ThreadingTCPServer((BIND_HOST, BIND_PORT), StorageTargetHandler) as server:
+        server.allow_reuse_address = True
         server.serve_forever()
-    except KeyboardInterrupt:
-        print('\nshutting down')
-        server.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
