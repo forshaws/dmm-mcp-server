@@ -14,6 +14,8 @@
 //   local_jsonl — local JSONL data files (e.g. Lindisfarne M1)
 //   local_blob  — byte-offset fetch against a blob file via a storage_target
 //                 fetch service (demo: deterministic physical-address retrieval)
+//   local_lba   — raw 4KiB-sector/LBA fetch against a loop-device-backed
+//                 drive via storage_target.py (SN655 Level 2 raw block demo)
 //   url         — HTTP/S hosted resources
 //   webhook     — developer-defined endpoint (glacier, S3, SharePoint, generic)
 
@@ -412,6 +414,121 @@ async function handleLocalBlob(ref, operation, resolverConfig) {
   return unknownOperation(operation);
 }
 
+// ── local_lba handler ───────────────────────────────────────────────────────
+//
+// Raw 4KiB-sector fetch against a loop-device-backed drive, via the same
+// standalone storage_target TCP service pattern as local_blob — but no
+// filename, no VFS, no byte offsets. The coordinate is a hardware LBA and
+// a sector count, matching how the appliance's storage_target.py actually
+// seeks against /dev/loop0 (SN655 Level 2 raw block storage demo).
+//
+// Filereference format: <pool_name>::lba<N>::sectors<N>::
+//   e.g. sn655_pool_001::lba1380::sectors1::
+//
+// Parsed the same way as local_blob: split on '::' and match each token
+// fully anchored by position. This is deliberately NOT a whole-string
+// regex against a trailing "::" — TQNN's timestamp round-trip does not
+// reliably leave one on the end (see normaliseRef), so anchoring parsing
+// to string-end would silently fail on non-fpd records. Position-based
+// split matching is immune to that regardless of what survives at the end.
+
+async function fetchFromStorageTargetLba(host, portNum, lba, sectors) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port: portNum }, () => {
+      socket.write(JSON.stringify({ lba, sectors }) + '\n');
+    });
+    let chunks = [];
+    socket.on('data', (d) => chunks.push(d));
+    socket.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        resolve(body);
+      } catch (e) {
+        reject(new Error(`storage_target response parse error: ${e.message}`));
+      }
+    });
+    socket.on('error', reject);
+    socket.setTimeout(10000, () => {
+      socket.destroy();
+      reject(new Error('storage_target connection timed out'));
+    });
+  });
+}
+
+async function handleLocalLba(ref, operation, resolverConfig) {
+  const cfg = resolverConfig.config || {};
+  const targetHost = cfg.target_host || '127.0.0.1';
+  const targetPort = cfg.target_port || 9600;
+  const sectorSize = cfg.sector_size || 4096;
+
+  const clean = normaliseRef(ref).replace(/::$/, '');
+  const parts = clean.split('::');
+  const poolName = parts[0];
+  const lbaMatch     = (parts[1] || '').match(/^lba(\d+)$/);
+  const sectorsMatch = (parts[2] || '').match(/^sectors(\d+)$/);
+
+  if (!lbaMatch || !sectorsMatch) {
+    return {
+      status: 'ERROR',
+      resolver: 'local_lba',
+      filereference: ref,
+      message: 'Expected filereference format <pool>::lbaN::sectorsN::'
+    };
+  }
+  const lba = parseInt(lbaMatch[1], 10);
+  const sectors = parseInt(sectorsMatch[1], 10);
+
+  if (operation === 'ping') {
+    try {
+      // Probe sector 0 — checks storage_target reachability, not this
+      // specific record (sector 0 is guaranteed to exist on any populated pool).
+      const result = await fetchFromStorageTargetLba(targetHost, targetPort, 0, 1);
+      return { status: result.status === 'OK' ? 'AVAILABLE' : 'UNREACHABLE', resolver: 'local_lba', filereference: ref };
+    } catch (e) {
+      return { status: 'UNREACHABLE', resolver: 'local_lba', filereference: ref, error: e.message };
+    }
+  }
+
+  if (operation === 'info') {
+    return {
+      status: 'AVAILABLE',
+      resolver: 'local_lba',
+      filereference: ref,
+      pool: poolName,
+      lba,
+      sectors,
+      sector_size: sectorSize,
+      byte_length: sectors * sectorSize
+    };
+  }
+
+  if (operation === 'fetch') {
+    const resolveEnd = process.hrtime.bigint();
+    try {
+      const result = await fetchFromStorageTargetLba(targetHost, targetPort, lba, sectors);
+      const fetchEnd = process.hrtime.bigint();
+      if (result.status !== 'OK') {
+        return { status: result.status || 'ERROR', resolver: 'local_lba', filereference: ref, message: result.message || 'storage_target returned an error' };
+      }
+      return {
+        status: 'OK',
+        resolver: 'local_lba',
+        filereference: ref,
+        pool: poolName,
+        lba,
+        sectors,
+        fetch_ms: Number(fetchEnd - resolveEnd) / 1e6,
+        encoding: 'base64',
+        content_base64: result.content_base64
+      };
+    } catch (e) {
+      return { status: 'UNREACHABLE', resolver: 'local_lba', filereference: ref, error: e.message };
+    }
+  }
+
+  return unknownOperation(operation);
+}
+
 // ── url handler ─────────────────────────────────────────────────────────────
 
 async function handleUrl(ref, operation, resolverConfig) {
@@ -656,6 +773,7 @@ async function resolverDispatch(filereference, operation) {
       case 'memory':      return await handleMemory(ref, operation);
       case 'local_jsonl': return await handleLocalJsonl(ref, operation, resolver);
       case 'local_blob':  return await handleLocalBlob(ref, operation, resolver);
+      case 'local_lba':   return await handleLocalLba(ref, operation, resolver);
       case 'url':         return await handleUrl(ref, operation, resolver);
       case 'webhook':     return await handleWebhook(ref, operation, resolver);
       default:
