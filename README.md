@@ -14,13 +14,15 @@ Licence: [MIT](https://opensource.org/licenses/MIT)
 Claude (reasoning/generation)
         │  MCP tool calls  [OAuth 2.1 Bearer token]
         ▼
-tqnn-mcp-server  ◄──── similarity orchestration, tokenisation, FPD, threshold
+tqnn-mcp-server  ◄──── similarity orchestration, tokenisation, FPD, threshold,
+        │               per-employee auth + DMM credential routing
         │  multipart/form-data HTTP
         ▼
-TQNN DMM appliance  ◄──── pure associative memory primitive (searchDoc / storeDoc)
+TQNN DMM appliance  ◄──── pure associative memory primitive (searchDoc / storeDoc),
+                           dataset ACL enforcement (tqnn_acl_gate())
 ```
 
-DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All higher-level intelligence (tokenisation, overlap scoring, FPD, similarity ranking) lives in this server.
+DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All higher-level intelligence (tokenisation, overlap scoring, FPD, similarity ranking, employee auth, credential routing) lives in this server. **Dataset-level access control itself is enforced at the appliance**, not here — see [Authentication & per-employee access](#authentication--per-employee-access) for exactly where the line sits.
 
 ---
 
@@ -29,10 +31,12 @@ DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All high
 | Tool | Description |
 |---|---|
 | `tqnn_status` | Ping DMM — confirm connectivity at session start |
-| `tqnn_search` | Single `searchDoc` call — fast exact associative match |
-| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results |
-| `tqnn_store` | `storeDoc` wrapper — Claude can write associations into DMM |
+| `tqnn_search` | Single `searchDoc` call — fast exact associative match. Query is always PQR-hashed before sending. |
+| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results, IDF-weighted token scoring, optional FPD |
+| `tqnn_store` | `storeDoc` wrapper — Claude can write associations into DMM. Supports independent `pqr` and `fpd` toggles per call. |
 | `tqnn_get` | Resolver — retrieve content for any filereference via ping / info / fetch. See [docs/resolvers.md](docs/resolvers.md) |
+
+> **Note:** `tqnn_search` and `tqnn_similarity` do not currently expose a `pqr` opt-out the way `tqnn_store` does — both tools always PQR-hash the query before sending. A matching `pqr` boolean for the two search-side tools (to support plaintext/legacy-hash datasets without a wrapper) is planned but not yet implemented.
 
 ---
 
@@ -41,7 +45,7 @@ DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All high
 | Mode | Use case | Auth |
 |---|---|---|
 | `stdio` | Claude Code, local development | None — credentials from environment |
-| `sse` | claude.ai remote connector, production | OAuth 2.1 required |
+| `sse` | claude.ai remote connector, production | OAuth 2.1 required, optionally per-employee (see below) |
 
 ---
 
@@ -97,7 +101,7 @@ No auth required. Add to `~/.claude/settings.json`:
 }
 ```
 
-That's it — Claude Code picks it up automatically.
+That's it — Claude Code picks it up automatically. Per-employee accounts (below) don't apply in stdio mode — there's no OAuth handshake to attach a username to, so the server always uses the static `.env` credential pair here.
 
 ---
 
@@ -126,6 +130,8 @@ POST /messages (Authorization: Bearer …)  ────────────
 Token lifetime: 1 hour access / 30 days refresh (rotated on each use). All state is
 in-memory — a server reboot means users re-authenticate with one click in claude.ai.
 
+The consent form checks credentials against `tqnn_mcp_users.json` if present (per-employee accounts), falling back to the single `TQNN_OAUTH_USER`/`TQNN_OAUTH_PASS` admin login if it isn't. See [Authentication & per-employee access](#authentication--per-employee-access) below.
+
 ---
 
 **Step 1 — Prepare your .env**
@@ -143,7 +149,8 @@ TQNN_PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 # Generate: node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 TQNN_MCP_SECRET=your_generated_secret_min_32_chars
 
-# Credentials for the OAuth consent page (what you log in with in the browser).
+# Credentials for the OAuth consent page (fallback admin login — see
+# Authentication & per-employee access below for the per-employee path).
 TQNN_OAUTH_USER=admin
 TQNN_OAUTH_PASS=your_strong_password
 ```
@@ -208,7 +215,7 @@ curl https://your-ngrok-url.ngrok-free.app/health
 3. Leave the OAuth Client ID / Client Secret fields **blank** — claude.ai registers
    itself automatically via Dynamic Client Registration.
 4. Save. A browser tab opens to your consent page.
-5. Log in with `TQNN_OAUTH_USER` / `TQNN_OAUTH_PASS` and click **Approve**.
+5. Log in with your employee account (or `TQNN_OAUTH_USER` / `TQNN_OAUTH_PASS` if you haven't set up per-employee accounts yet) and click **Approve**.
 6. You'll be redirected back to claude.ai. The connector shows **Connected**.
 
 ---
@@ -236,6 +243,14 @@ node mcp-test.js
 
 All five tests should pass. `test.js` tests raw DMM connectivity; `mcp-test.js`
 tests the MCP protocol layer on top.
+
+There's also a standalone resolver-layer test that needs neither a DMM connection nor the MCP stack — useful when you've just edited `tqnn_resolvers.json` (e.g. adding a new scheme) and want to confirm it parses and routes correctly before wiring it up end to end:
+
+```bash
+node resolver-test.js
+```
+
+Covers config loading, `normaliseRef` timestamp-stripping, `NO_RESOLVER` on an unknown scheme, and all built-in handlers (`memory`, `local_jsonl`, `url`, `webhook`/`cold_storage`) plus `NOT_FOUND` edge cases, using synthetic data. It does not exercise `local_blob`/`local_lba` directly (those need a live `storage_target.py`), but it will confirm any new scheme entry — like `sn655_pool_` — is at least syntactically wired up correctly.
 
 ---
 
@@ -275,6 +290,66 @@ git pull
 pm2 restart tqnn-mcp
 ```
 
+Remember: `tqnn_resolvers.json`, `tqnn_mcp_users.json`, and `tqnn_mcp_credentials.json` are all cached in-process (by mtime for the latter two, at startup for the resolver config) — edits to any of them need a restart (or, for the two per-employee JSON files, take effect on the very next request with no restart at all — see below).
+
+---
+
+## Authentication & per-employee access
+
+Two independent, file-based layers sit on top of the OAuth 2.1 flow described above. Both are optional — if their config files are absent, the server behaves exactly as a fresh install always has (single shared admin login, static `.env` DMM credentials). Nothing breaks if you never touch this section.
+
+### Per-employee login (`tqnn_mcp_users.json`)
+
+When this file is present, it replaces the single shared `TQNN_OAUTH_USER`/`TQNN_OAUTH_PASS` admin login with individual employee accounts:
+
+```json
+{
+  "users": {
+    "example_user": {
+      "label": "Example User — replace or remove this entry",
+      "password_hash": "REPLACE_WITH_OUTPUT_OF_tqnn_mcp_hash_password.js",
+      "status": "active"
+    }
+  }
+}
+```
+
+- Generate a `password_hash` with:
+  ```bash
+  node tqnn_mcp_hash_password.js "the employee's password"
+  ```
+  (scrypt, random salt each run — re-running for the same password produces a different-looking hash and that's expected; either is valid.)
+- **Live revocation.** `status` is checked at the OAuth consent screen *and* on every subsequent MCP request — not just at login. Set an employee's status to `"disabled"` and their access is revoked on their very next request, including if they're holding an unexpired access token. No restart needed.
+- If `tqnn_mcp_users.json` is missing entirely, the server falls back to the legacy single-admin login from `.env` — a non-breaking change for anyone who hasn't set up per-employee accounts.
+
+### Per-employee DMM credentials (`tqnn_mcp_credentials.json`)
+
+Separately, this file maps each authenticated employee (by username, matching the entry above) to their own DMM sub-credential pair:
+
+```json
+{
+  "default": {
+    "sub_apikey": "REPLACE_WITH_SUB_APIKEY_FROM_ACL_CONSOLE",
+    "sub_apisecret": "REPLACE_WITH_SUB_APISECRET_FROM_ACL_CONSOLE",
+    "dataset": "REPLACE_WITH_ONE_OF_THIS_CREDENTIALS_PERMITTED_DATASETS"
+  },
+  "users": {
+    "example_user": {
+      "sub_apikey": "REPLACE_WITH_SUB_APIKEY_FROM_ACL_CONSOLE",
+      "sub_apisecret": "REPLACE_WITH_SUB_APISECRET_FROM_ACL_CONSOLE",
+      "dataset": "REPLACE_WITH_ONE_OF_THIS_CREDENTIALS_PERMITTED_DATASETS"
+    }
+  }
+}
+```
+
+**Important — where enforcement actually happens:** the sub-credential pairs referenced here are generated on the DMM appliance itself, via its ACL console (`tqnn_acl_manager.php`'s "generate" action) — not invented by this server. This file's only job is picking *which* credential pair to send for a given authenticated employee; the actual dataset whitelist enforcement happens appliance-side, in `esec.php`'s `tqnn_acl_gate()`. This server never duplicates or re-implements that access-control logic — it's purely a routing layer on top of it.
+
+- The optional per-user `dataset` field sets that credential's *default* dataset for calls that don't explicitly specify one (`tqnn_status`/ping being the main case) — it must be one of the datasets that sub-credential is actually whitelisted for on the appliance, or the ping will 403.
+- Resolution order: authenticated username → matching entry in `users` → else `default` entry → else the static `.env` `TQNN_API_KEY`/`TQNN_API_SECRET` pair. So an employee with no specific entry, and a `default` block with placeholder values, still functions — it just uses the server's own static credentials, same as before this feature existed.
+- Employees authenticate once per OAuth session; every tool call on that connection reuses the same resolved DMM client (cached by credential pair), so credential resolution isn't repeated per tool call.
+- stdio mode (Claude Code) has no OAuth username to look up, so it always uses the static `.env` pair regardless of what's in this file.
+
 ---
 
 ## Configuration
@@ -282,17 +357,19 @@ pm2 restart tqnn-mcp
 | Variable | Default | Description |
 |---|---|---|
 | `TQNN_BASE_URL` | `https://tqnn.local` | DMM appliance URL |
-| `TQNN_API_KEY` | *(required)* | DMM API key |
-| `TQNN_API_SECRET` | *(required)* | DMM API secret |
+| `TQNN_API_KEY` | *(required)* | DMM API key — also the fallback used when per-employee credentials aren't configured |
+| `TQNN_API_SECRET` | *(required)* | DMM API secret — see above |
 | `TQNN_DATASET` | *(empty)* | Default dataset/namespace |
 | `NODE_TLS_REJECT_UNAUTHORIZED` | *(unset)* | Set `0` for tqnn.local self-signed cert only |
 | `MCP_MODE` | `stdio` | `stdio` or `sse` |
 | `MCP_PORT` | `3100` | HTTP port (SSE mode only) |
 | `TQNN_PUBLIC_URL` | *(required in SSE mode)* | Public HTTPS URL of this server |
 | `TQNN_MCP_SECRET` | *(required in SSE mode)* | HMAC secret for token signing (≥32 chars) |
-| `TQNN_OAUTH_USER` | `admin` | Username for the OAuth consent page |
-| `TQNN_OAUTH_PASS` | *(required in SSE mode)* | Password for the OAuth consent page |
+| `TQNN_OAUTH_USER` | `admin` | Username for the OAuth consent page — legacy/fallback login, superseded per-user by `tqnn_mcp_users.json` when present |
+| `TQNN_OAUTH_PASS` | *(required in SSE mode)* | Password for the OAuth consent page — same fallback scope as above |
 | `CORS_ORIGIN` | `*` | Restrict to `https://claude.ai` in production |
+
+Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_credentials.json`) are file-based, not env-configured — see [Authentication & per-employee access](#authentication--per-employee-access) above.
 
 ---
 
@@ -306,24 +383,26 @@ pm2 restart tqnn-mcp
 
 ## Implementation notes
 
-- **PQR hash** — `searchDoc` pattern must be `SHA-256(pad_to_16_chars(token))`. Raw text will not work.
+- **PQR hash (self-salting, V1.3.0+)** — `searchDoc`/`storeDoc` patterns are hashed with the self-salting scheme, not a static pad: `h1 = SHA-256(input)` → `mixed = input + h1` → `padded = mixed.slice(0, 16)` → `token = SHA-256(padded).slice(0, 16)`. The salt is derived from the input itself, so it defeats rainbow-table attacks without needing external key material or extra storage, and every input is lifted into the full 2²⁵⁶ hash space regardless of its own entropy. The old constant-padding scheme (padding short tokens with `*`) is superseded and kept in `similarity.js` only for reference/rollback — it's vulnerable to rainbow tables on low-entropy fields. **Any dataset still stored under the old scheme needs re-ingesting** before it will match self-salted search hashes.
 - **FPD** — False Positive Defence: two `searchDoc` calls per token (forward + reversed input string), AND the result sets. Only filereferences in both are genuine.
 - **Filelist** — DMM returns filelist as newline-delimited string, not JSON array.
 - **Timestamps** — DMM appends a raw unix timestamp directly onto whatever filereference string it's given, with no separator of its own. This is why every filereference written to DMM should always end in `::` — that trailing `::` is what lets the timestamp be stripped cleanly back off on read (split on the *last* `::`, keep everything before it). One consequence worth knowing: if the original filereference had *only one* `::`-terminated segment at the very end (e.g. `pool::lba5::sectors1::`, no fpd suffix), the returned filereference after strip has **no trailing `::` at all** (`pool::lba5::sectors1`). If it had a `::`-delimited suffix after that (e.g. an `fpd_XXXXXXXX::` specialcode), one `::` survives in the middle. Either way: never write a custom resolver handler that requires a trailing `::` to parse correctly — split the string on `::` and match tokens by position instead. See [docs/resolvers.md](docs/resolvers.md) for the full explanation and both handlers (`local_blob`, `local_lba`) that already do this correctly.
 - **TLS** — `NODE_TLS_REJECT_UNAUTHORIZED=0` for tqnn.local only. Remove for any public HTTPS DMM endpoint with a valid cert.
 - **Node 18+** — uses built-in `FormData`, `fetch`, and `crypto`. No extra HTTP packages required.
-- **OAuth tokens** — HMAC-SHA256 signed, 1-hour lifetime, constant-time validation. Refresh tokens rotate on use (30-day lifetime). All state in-memory.
+- **OAuth tokens** — HMAC-SHA256 signed, 1-hour lifetime, constant-time validation. Refresh tokens rotate on use (30-day lifetime). All state in-memory. Token validation also carries a live per-employee revocation check (see [Authentication & per-employee access](#authentication--per-employee-access)) — this is in addition to, not instead of, signature/expiry checks.
 
 ---
 
 ## Security
 
 - OAuth 2.1 with PKCE (S256) is enforced on all SSE endpoints. Unauthenticated requests receive `401 + WWW-Authenticate`.
-- `TQNN_OAUTH_PASS` is SHA-256 hashed immediately on startup and never held in memory as plaintext.
+- `TQNN_OAUTH_PASS` is SHA-256 hashed immediately on startup and never held in memory as plaintext. Per-employee passwords in `tqnn_mcp_users.json` use scrypt with a random salt per entry (`salt_hex:hash_hex`), verified in constant time.
 - Token comparisons use `crypto.timingSafeEqual` throughout.
 - Dynamic Client Registration is open (no pre-shared secret required) — consistent with the MCP spec and how claude.ai connects. `tqnn_store` is still protected behind OAuth.
 - Set `CORS_ORIGIN=https://claude.ai` in `.env` for production deployments.
 - Remove `NODE_TLS_REJECT_UNAUTHORIZED=0` if your DMM appliance uses a properly signed certificate.
+- `tqnn_mcp_credentials.json` and `tqnn_mcp_users.json` contain (or reference) credentials/secrets — treat them like `.env`, not like general-purpose config: don't commit real values, and restrict file permissions on the server the same way you would for `.env`.
+- Dataset-level access control is enforced on the DMM appliance (`esec.php`'s `tqnn_acl_gate()`), not in this server — see [Authentication & per-employee access](#authentication--per-employee-access) for the exact division of responsibility.
 
 ---
 
@@ -338,8 +417,13 @@ pm2 restart tqnn-mcp
 - Leave both fields blank. Claude registers itself automatically.
 
 **Consent page shows "Invalid credentials"**
-- Check `TQNN_OAUTH_USER` and `TQNN_OAUTH_PASS` in `.env`.
-- `pm2 restart tqnn-mcp` after any `.env` change.
+- If using per-employee accounts: check the username exists in `tqnn_mcp_users.json`, `status` is `"active"`, and the password matches what `tqnn_mcp_hash_password.js` was run against.
+- Otherwise: check `TQNN_OAUTH_USER` and `TQNN_OAUTH_PASS` in `.env`.
+- `pm2 restart tqnn-mcp` after any `.env` change (edits to `tqnn_mcp_users.json`/`tqnn_mcp_credentials.json` do **not** need a restart — they're re-read on the next request).
+
+**An employee's access won't revoke / they can still call tools after being disabled**
+- Confirm their entry in `tqnn_mcp_users.json` has `"status": "disabled"` exactly (not `"inactive"` or removed entirely — a missing entry falls through to "no per-employee accounts configured" logic differently than an explicitly disabled one in edge cases, so prefer explicit disabling over deletion).
+- This check is live on every request, so if access is still working, first confirm the file actually saved / the edit reached the server the process is running on.
 
 **"Session not found" after approving**
 - The server restarted between authorization and the first tool call. Reconnect the integration in claude.ai.
