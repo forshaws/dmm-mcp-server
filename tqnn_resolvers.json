@@ -104,6 +104,18 @@
       }
     },
     {
+      "_use_case": "SN655 Level 2 raw LBA block storage demo — true 4KiB sector-addressed fetch via storage_target.py against a loop-device-backed drive, no VFS/file read. Replaces the old lindisfarne_blob_ off/len scheme, which is retired.",
+      "_example_ref": "sn655_pool_001::lba1380::sectors1::",
+      "scheme": "sn655_pool_",
+      "type": "local_lba",
+      "handler": "local_lba",
+      "config": {
+        "target_host": "127.0.0.1",
+        "target_port": 9600,
+        "sector_size": 4096
+      }
+    },
+    {
       "_use_case": "Catch-all for non-logical refs: https://, C:\\, \\\\server\\, /mnt/ etc.",
       "_example_ref": "https://s3.amazonaws.com/old-bucket/report.pdf::",
       "_behaviour": "Full filereference passed as-is to middleware. Middleware handles URL rewriting, drive mapping, SMB resolution, bucket migration etc. DMM filereferences never change.",
