@@ -432,7 +432,10 @@ async function startStdio() {
 // ── SSE mode ───────────────────────────────────────────────────────────────────
 async function startSSE() {
   const http = require('http');
+  const crypto = require('crypto');
   const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
+  const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+  const { isInitializeRequest } = require('@modelcontextprotocol/sdk/types.js');
 
   // ── OAuth setup ──────────────────────────────────────────────────────────────
   if (!CONFIG.publicUrl) {
@@ -457,7 +460,8 @@ async function startSSE() {
     adminPass:  CONFIG.oauthPass,
   });
 
-  const sessions = new Map(); // sessionId → { transport, mcpServer }
+  const sessions = new Map(); // sessionId → { transport, mcpServer }  (legacy /sse + /messages — DMM Workbench)
+  const streamableSessions = new Map(); // sessionId → { transport, mcpServer }  (/mcp — claude.ai connector)
 
   const httpServer = http.createServer(async (req, res) => {
     // ── CORS ──────────────────────────────────────────────────────────────────
@@ -465,7 +469,8 @@ async function startSSE() {
     const corsOrigin = process.env.CORS_ORIGIN || '*';
     res.setHeader('Access-Control-Allow-Origin', corsOrigin);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, mcp-session-id');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, mcp-session-id, mcp-protocol-version');
+    res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
 
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -589,6 +594,94 @@ async function startSSE() {
       return;
     }
 
+    // ── Streamable HTTP endpoint (current MCP spec, 2025-06-18) ────────────────
+    // This is what claude.ai's connector UI speaks. The legacy /sse + /messages
+    // pair below is kept as-is for DMM Workbench and anything else still using
+    // the old two-endpoint HTTP+SSE transport — both can run side by side.
+    if (url === '/mcp' && ['GET', 'POST', 'DELETE'].includes(req.method)) {
+      const authResult = oauth.validateToken(req.headers['authorization'] || '');
+      if (!authResult.valid) {
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'WWW-Authenticate': `Bearer resource_metadata="${publicBase}/.well-known/oauth-protected-resource"`
+        });
+        res.end(JSON.stringify({ error: 'unauthorized', error_description: 'Valid Bearer token required' }));
+        return;
+      }
+
+      const sessionId = req.headers['mcp-session-id'];
+
+      if (req.method === 'POST') {
+        let raw = '';
+        req.on('data', chunk => { raw += chunk; });
+        req.on('end', async () => {
+          let parsedBody;
+          try {
+            parsedBody = raw ? JSON.parse(raw) : undefined;
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }));
+            return;
+          }
+
+          try {
+            const existing = sessionId ? streamableSessions.get(sessionId) : null;
+
+            if (existing) {
+              await existing.transport.handleRequest(req, res, parsedBody);
+              return;
+            }
+
+            if (!sessionId && isInitializeRequest(parsedBody)) {
+              const mcpServer = createMcpServer(authResult);
+              const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => crypto.randomUUID(),
+                onsessioninitialized: (sid) => {
+                  streamableSessions.set(sid, { transport, mcpServer });
+                  process.stderr.write(`[tqnn-mcp] New Streamable HTTP session (client: ${authResult.client_id}, user: ${authResult.username || 'n/a'}, session: ${sid})\n`);
+                }
+              });
+              transport.onclose = () => {
+                const sid = transport.sessionId;
+                if (sid && streamableSessions.has(sid)) {
+                  streamableSessions.delete(sid);
+                  mcpServer.close?.();
+                  process.stderr.write(`[tqnn-mcp] Streamable HTTP session closed (${sid})\n`);
+                }
+              };
+              await mcpServer.connect(transport);
+              await transport.handleRequest(req, res, parsedBody);
+              return;
+            }
+
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+              id: null
+            }));
+          } catch (err) {
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: err.message }, id: null }));
+            }
+          }
+        });
+        return;
+      }
+
+      // GET (standalone SSE stream for server-initiated notifications) and
+      // DELETE (explicit session termination) both need an existing session.
+      const existing = sessionId ? streamableSessions.get(sessionId) : null;
+      if (!existing) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid_session', error_description: 'No active session for this ID' }));
+        return;
+      }
+      await existing.transport.handleRequest(req, res);
+      return;
+    }
+
     // ── Messages endpoint ──────────────────────────────────────────────────────
     if (url?.startsWith('/messages') && req.method === 'POST') {
       const authResult = oauth.validateToken(req.headers['authorization'] || '');
@@ -630,7 +723,7 @@ async function startSSE() {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       error: 'Not found',
-      available: ['/sse', '/messages', '/health',
+      available: ['/mcp', '/sse', '/messages', '/health',
         '/.well-known/oauth-protected-resource',
         '/.well-known/oauth-authorization-server',
         '/oauth/register', '/oauth/authorize', '/oauth/token']
@@ -640,7 +733,8 @@ async function startSSE() {
   httpServer.listen(CONFIG.port, () => {
     process.stderr.write(`[tqnn-mcp] Running in SSE mode on port ${CONFIG.port}\n`);
     process.stderr.write(`[tqnn-mcp] Public URL   : ${publicBase}\n`);
-    process.stderr.write(`[tqnn-mcp] SSE endpoint : ${publicBase}/sse\n`);
+    process.stderr.write(`[tqnn-mcp] MCP endpoint : ${publicBase}/mcp  (use this in claude.ai connector settings)\n`);
+    process.stderr.write(`[tqnn-mcp] SSE endpoint : ${publicBase}/sse  (legacy — DMM Workbench only)\n`);
     process.stderr.write(`[tqnn-mcp] Health check : ${publicBase}/health\n`);
     process.stderr.write(`[tqnn-mcp] OAuth AS     : ${publicBase}/.well-known/oauth-authorization-server\n`);
     process.stderr.write(`[tqnn-mcp] DMM base URL : ${CONFIG.baseUrl}\n`);
