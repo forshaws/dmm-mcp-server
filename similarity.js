@@ -166,11 +166,24 @@ function tokenWeight(docCount) {
  *
  * @param {TQNNClient} client
  * @param {string} token
- * @param {boolean} fpd - Enable False Positive Defence
+ * @param {boolean} fpd - Enable False Positive Defence (ignored when pqr:false — nothing to reverse)
  * @param {string} dataset - Dataset/namespace
+ * @param {boolean} [pqr=true] - PQR-hash the token before searching. Set false to search the
+ *   raw token directly — for records stored via tqnn_store pqr:false (DMM's own storeDoc.php
+ *   tokenises/keys every value regardless, so no client-side hashing is needed on this path).
  * @returns {Promise<string[]>} Array of original filereference strings (with timestamp)
  */
-async function searchToken(client, token, fpd, dataset) {
+async function searchToken(client, token, fpd, dataset, pqr = true) {
+  if (!pqr) {
+    // Plain mode — no hashing, no FPD (there's no hash to reverse against).
+    const fwdResult = await client.searchDoc(token, dataset);
+    const fwdRefs = new Map();
+    for (const ref of parseFilelist(fwdResult)) {
+      fwdRefs.set(stripTimestamp(ref), ref);
+    }
+    return [...fwdRefs.values()];
+  }
+
   const fwdResult = await client.searchDoc(pqrHash(token), dataset);
   const fwdRefs = new Map(); // stripped → original
   for (const ref of parseFilelist(fwdResult)) {
@@ -215,6 +228,9 @@ async function searchToken(client, token, fpd, dataset) {
  * @param {number} [options.maxResults=20] - Maximum results to return
  * @param {boolean} [options.weighted=true] - Use IDF-style token weighting.
  *   Set false to fall back to pre-v1.4.0 flat hit-counting behaviour.
+ * @param {boolean} [options.pqr=true] - PQR-hash each token before searching. Set false for
+ *   plain/unhashed similarity search — matches records stored with tqnn_store pqr:false.
+ *   When false, fpd is forced off regardless of what was passed (no hash to reverse).
  * @returns {Promise<SimilarityResult>}
  */
 async function similaritySearch(client, text, {
@@ -222,8 +238,10 @@ async function similaritySearch(client, text, {
   dataset = '',
   fpd = true,
   maxResults = 20,
-  weighted = true
+  weighted = true,
+  pqr = true
 } = {}) {
+  const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
   if (tokens.length === 0) {
     return {
@@ -232,6 +250,8 @@ async function similaritySearch(client, text, {
       matches_found: 0,
       threshold_pct: threshold * 100,
       weighted,
+      pqr,
+      fpd: effectiveFpd,
       results: [],
       message: 'No searchable tokens found in input text.'
     };
@@ -246,7 +266,7 @@ async function similaritySearch(client, text, {
   for (const token of tokens) {
     let refs;
     try {
-      refs = await searchToken(client, token, fpd, dataset);
+      refs = await searchToken(client, token, effectiveFpd, dataset, pqr);
     } catch (err) {
       // Log and continue — one failed token shouldn't abort the whole search
       process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
@@ -288,6 +308,8 @@ async function similaritySearch(client, text, {
     matches_found: matched.length,
     threshold_pct: threshold * 100,
     weighted,
+    pqr,
+    fpd: effectiveFpd,
     token_weights: tokenInfo, // per-token doc frequency + weight, for auditability
     results: matched
   };
