@@ -48,7 +48,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
-const { similaritySearch, pqrHash, pqrHashReversed, tokenise } = require('./similarity');
+const { similaritySearch, pqrHash, pqrHashReversed, tokenise, stripTimestamp } = require('./similarity');
 const { OAuthServer, readBody } = require('./oauth');
 const { resolverDispatch, registerMemory } = require('./resolver');
 const fs   = require('fs');
@@ -191,21 +191,36 @@ server.tool(
   'tqnn_search',
   'Search the TQNN DMM associative memory for documents matching a pattern. Returns file references associated with the search terms. Use for targeted retrieval where query terms are specific and known.',
   {
-    query: z.string().describe('The search term to query against DMM associative memory. Single token works best — the term is PQR-hashed before searching.'),
+    query: z.string().describe('The search term to query against DMM associative memory. Single token works best.'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within. Overrides server default.'),
-    return_filelist: z.number().int().min(0).max(1).default(1).optional().describe('Set to 1 to return full filelist. Default 1.')
+    return_filelist: z.number().int().min(0).max(1).default(1).optional().describe('Set to 1 to return full filelist. Default 1.'),
+    pqr: z.boolean().default(false).optional().describe('PQR-hash the query before searching. Default false, matching the DMM REST API and Workbench, where PQR is opt-in — set true to hash the query, and it must match how the target record was stored (tqnn_store pqr:true).'),
+    fpd: z.boolean().default(false).optional().describe('Enable False Positive Defence — makes a second search on the reversed-input hash and returns only filereferences present in both, filtering out hash collisions. Default false, matching the API/Workbench default; set true for higher-confidence results at the cost of a second DMM call. Only applies when pqr:true (ignored, and reported as false, when pqr:false — there is no hash to reverse).')
   },
-  async ({ query, dataset, return_filelist = 1 }) => {
+  async ({ query, dataset, return_filelist = 1, pqr = false, fpd = false }) => {
     try {
-      const hash = pqrHash(query.trim());
+      const trimmed = query.trim();
+      const hash = pqr ? pqrHash(trimmed) : trimmed;
       const result = await client.searchDoc(hash, dataset);
-      const filelist = (result.filelist || '').split('\n').map(r => r.trim()).filter(Boolean);
+      let filelist = (result.filelist || '').split('\n').map(r => r.trim()).filter(Boolean);
+
+      const fpdApplied = pqr && fpd;
+      if (fpdApplied) {
+        const revResult = await client.searchDoc(pqrHashReversed(trimmed), dataset);
+        const revStripped = new Set(
+          (revResult.filelist || '').split('\n').map(r => r.trim()).filter(Boolean).map(stripTimestamp)
+        );
+        filelist = filelist.filter(ref => revStripped.has(stripTimestamp(ref)));
+      }
+
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             query,
-            pqr_hash: hash,
+            pqr_enabled: pqr,
+            pqr_hash: pqr ? hash : null,
+            fpd_enabled: fpdApplied,
             result_count: filelist.length,
             filereferences: filelist,
             dmm_response: { code: result.code, type: result.type, message: result.message }
@@ -258,13 +273,13 @@ server.tool(
   'Store a document reference and its metadata into TQNN DMM associative memory. Use when Claude needs to persist new knowledge associations during an agentic session.',
   {
     filereference: z.string().describe('URI or path to the document. Must end with :: e.g. memory://claude/session/2026-06-20::'),
-    pattern: z.string().describe('JSON array of metadata objects e.g. [{"title":"Report","year":2024}]. Field values are tokenised and PQR-hashed before storage.'),
+    pattern: z.string().describe('JSON array of metadata objects e.g. [{"title":"Report","year":2024}]. Stored raw by default; set pqr:true to tokenise and PQR-hash field values before storage.'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace.'),
-    pqr: z.boolean().default(true).optional().describe('Enable PQR hashing of pattern field values before storage. Default true. Must match search mode.'),
-    fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence — stores both forward and reversed-input hashes per token. Default true. Required for tqnn_similarity with fpd:true.'),
+    pqr: z.boolean().default(false).optional().describe('Enable PQR hashing of pattern field values before storage. Default false, matching the DMM REST API and Workbench, where PQR is opt-in. Must match search mode.'),
+    fpd: z.boolean().default(false).optional().describe('Enable False Positive Defence — stores both forward and reversed-input hashes per token. Default false, matching the API/Workbench default. Required for tqnn_similarity with fpd:true, and for tqnn_search with fpd:true.'),
     create_ots: z.boolean().default(false).optional().describe('Submit SHA-256 fingerprint to OpenTimestamps Bitcoin calendar for blockchain anchoring.')
   },
-  async ({ filereference, pattern, dataset, pqr = true, fpd = true, create_ots = false }) => {
+  async ({ filereference, pattern, dataset, pqr = false, fpd = false, create_ots = false }) => {
     try {
       // ── Parse and validate pattern ──────────────────────────────────────────
       let parsedPattern;
@@ -298,7 +313,17 @@ server.tool(
         for (const obj of parsedPattern) {
           for (const val of Object.values(obj)) {
             if (typeof val === 'string') {
-              for (const tok of tokenise(val)) allTokens.add(tok);
+              const toks = tokenise(val);
+              if (toks.length > 0) {
+                for (const tok of toks) allTokens.add(tok);
+              } else if (val.trim().length >= 4) {
+                // tokenise() only extracts alphabetic runs (>= MIN_TOKEN_LENGTH),
+                // so numeric-only or short-alnum strings (IMEIs, serials, IDs)
+                // come back empty and would otherwise be silently dropped.
+                // Fall back to storing the raw trimmed value as a single token,
+                // matching how tqnn_search hashes its query (raw, untokenised).
+                allTokens.add(val.trim());
+              }
             } else if (val !== null && val !== undefined) {
               // Non-string scalars: stringify and treat as single token if long enough
               const s = String(val);
