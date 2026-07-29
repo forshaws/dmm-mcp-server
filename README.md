@@ -14,15 +14,18 @@ Licence: [MIT](https://opensource.org/licenses/MIT)
 Claude (reasoning/generation)
         │  MCP tool calls  [OAuth 2.1 Bearer token]
         ▼
-tqnn-mcp-server  ◄──── similarity orchestration, tokenisation, FPD, threshold,
+tqnn-mcp-server  ◄──── similarity orchestration, overlap scoring, PQR/FPD opt-in,
         │               per-employee auth + DMM credential routing
         │  multipart/form-data HTTP
         ▼
 TQNN DMM appliance  ◄──── pure associative memory primitive (searchDoc / storeDoc),
+                           its own internal tokenisation and hashing,
                            dataset ACL enforcement (tqnn_acl_gate())
 ```
 
-DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All higher-level intelligence (tokenisation, overlap scoring, FPD, similarity ranking, employee auth, credential routing) lives in this server. **Dataset-level access control itself is enforced at the appliance**, not here — see [Authentication & per-employee access](#authentication--per-employee-access) for exactly where the line sits.
+DMM is a pure associative-memory primitive: an input goes in, an O(1)-addressable key comes out, on both the store and search side. `storeDoc.php` splits every field name and value on whitespace/punctuation and hashes each resulting word with its own fixed-width token function, unconditionally — this happens regardless of what the client sends. `searchDoc.php` treats its incoming pattern as a single opaque string, strips it to alphanumeric+underscore, and hashes it once as a single atomic lookup key — it does not tokenise a multi-word query into separate searches.
+
+Everything above that — deciding whether to pre-hash a value before sending it (`pqr`), whether to cross-check a reversed hash to filter false positives (`fpd`), how a free-text query gets split into individual search calls, how those results get combined and ranked, employee auth, and DMM credential routing — is client-side logic implemented in this server, not part of DMM itself. **Dataset-level access control itself is enforced at the appliance**, not here — see [Authentication & per-employee access](#authentication--per-employee-access) for exactly where the line sits.
 
 ---
 
@@ -31,12 +34,30 @@ DMM only ever sees individual `searchDoc` calls with PQR-hashed tokens. All high
 | Tool | Description |
 |---|---|
 | `tqnn_status` | Ping DMM — confirm connectivity at session start |
-| `tqnn_search` | Single `searchDoc` call — fast exact associative match. Query is always PQR-hashed before sending. |
-| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results, IDF-weighted token scoring, optional FPD |
-| `tqnn_store` | `storeDoc` wrapper — Claude can write associations into DMM. Supports independent `pqr` and `fpd` toggles per call. |
+| `tqnn_search` | Single `searchDoc` call — exact associative match on one query term. `pqr` (default `false`) and `fpd` (default `false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
+| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results, IDF-weighted token overlap scoring. `pqr` (default `true`) and `fpd` (default `true`, ignored when `pqr:false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
+| `tqnn_similarity_plain` | Same weighted-overlap algorithm as `tqnn_similarity`, always in plain (unhashed) mode — equivalent to calling `tqnn_similarity` with `pqr:false`, exposed as its own tool for callers who want a plaintext-only entry point with no flags to set |
+| `tqnn_store` | `storeDoc` wrapper — write associations into DMM. `pqr` (default `false`) and `fpd` (default `false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
 | `tqnn_get` | Resolver — retrieve content for any filereference via ping / info / fetch. See [docs/resolvers.md](docs/resolvers.md) |
 
-> **Note:** `tqnn_search` and `tqnn_similarity` do not currently expose a `pqr` opt-out the way `tqnn_store` does — both tools always PQR-hash the query before sending. A matching `pqr` boolean for the two search-side tools (to support plaintext/legacy-hash datasets without a wrapper) is planned but not yet implemented.
+`pqr` and `fpd` default to `false` on `tqnn_search` and `tqnn_store`, matching the DMM REST API and Workbench convention where both are opt-in. `tqnn_similarity` defaults `pqr` to `true` instead — `tqnn_similarity_plain` is the explicit, flagless route to its `pqr:false` behaviour.
+
+---
+
+## Query modes: PQR, FPD, and plain
+
+Three independent tools — `tqnn_search`, `tqnn_store`, `tqnn_similarity` — share the same two boolean flags. What they mean, and what must match between store and search for a lookup to succeed:
+
+| Flag | Effect | Default |
+|---|---|---|
+| `pqr` | PQR-hash the value client-side before sending it to DMM, using the same self-salting scheme DMM's own `tqnnToken16()` uses. | `false` on `tqnn_search`/`tqnn_store`, `true` on `tqnn_similarity` |
+| `fpd` | False Positive Defence — make a second call on the reversed input string's hash, and keep only results present in both the forward and reversed searches. Requires `pqr:true` on both the store and search side; ignored (and reported as `false`) whenever `pqr:false`, since there is no hash to reverse. | `false` everywhere except `tqnn_similarity` (`true`) |
+
+**Plain mode** (`pqr:false`) sends the value to DMM untouched. This still works for full free-text search, including multi-word values and purely numeric ones — DMM's own `storeDoc.php` tokenises and hashes every word server-side regardless of what the client sends (see [Architecture](#architecture)), so a plain-stored record is just as independently searchable, word by word, as a PQR-stored one.
+
+**Matching matters, not hashing itself.** A value stored with `pqr:true` produces a different (double-transformed) key than the same value stored with `pqr:false`, because DMM hashes on top of whatever the client sends either way. Searching with a `pqr` setting that doesn't match how the record was stored produces zero results, silently — there's no error, the search simply never reaches the right key. The rule of thumb: whatever `pqr` (and, if used, `fpd`) a record was stored with, search for it with the same setting.
+
+`tqnn_similarity_plain` and `tqnn_similarity` called with `pqr:false` are the same code path — pick whichever is more convenient for the caller.
 
 ---
 
@@ -383,8 +404,8 @@ Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_
 
 ## Implementation notes
 
-- **PQR hash (self-salting, V1.3.0+)** — `searchDoc`/`storeDoc` patterns are hashed with the self-salting scheme, not a static pad: `h1 = SHA-256(input)` → `mixed = input + h1` → `padded = mixed.slice(0, 16)` → `token = SHA-256(padded).slice(0, 16)`. The salt is derived from the input itself, so it defeats rainbow-table attacks without needing external key material or extra storage, and every input is lifted into the full 2²⁵⁶ hash space regardless of its own entropy. The old constant-padding scheme (padding short tokens with `*`) is superseded and kept in `similarity.js` only for reference/rollback — it's vulnerable to rainbow tables on low-entropy fields. **Any dataset still stored under the old scheme needs re-ingesting** before it will match self-salted search hashes.
-- **FPD** — False Positive Defence: two `searchDoc` calls per token (forward + reversed input string), AND the result sets. Only filereferences in both are genuine.
+- **DMM's internal token function** — both `storeDoc.php` and `searchDoc.php` run every value they handle through the same self-salting scheme, independently of anything this server does: `h1 = SHA-256(input)` → `mixed = input + h1` → `padded = mixed.slice(0, 16)` → `token = SHA-256(padded).slice(0, 16)`. The salt is derived from the input itself, so it defeats rainbow-table attacks without needing external key material or extra storage, and every input is lifted into the full 2²⁵⁶ hash space regardless of its own entropy. This happens on the appliance whether or not this server's `pqr` flag is set — see [Query modes](#query-modes-pqr-fpd-and-plain) for what `pqr` actually controls at the client layer. The old constant-padding scheme (padding short tokens with `*`) is superseded and kept in `similarity.js` only for reference/rollback — it's vulnerable to rainbow tables on low-entropy fields. **Any dataset still stored under the old scheme needs re-ingesting** before it will match self-salted search hashes.
+- **FPD** — False Positive Defence: two `searchDoc` calls per token (forward + reversed input string), AND the result sets. Only filereferences in both are genuine. Implemented identically in `tqnn_store`, `tqnn_search`, and `tqnn_similarity`; requires `pqr:true`, since there's no hash to reverse in plain mode.
 - **Filelist** — DMM returns filelist as newline-delimited string, not JSON array.
 - **Timestamps** — DMM appends a raw unix timestamp directly onto whatever filereference string it's given, with no separator of its own. This is why every filereference written to DMM should always end in `::` — that trailing `::` is what lets the timestamp be stripped cleanly back off on read (split on the *last* `::`, keep everything before it). One consequence worth knowing: if the original filereference had *only one* `::`-terminated segment at the very end (e.g. `pool::lba5::sectors1::`, no fpd suffix), the returned filereference after strip has **no trailing `::` at all** (`pool::lba5::sectors1`). If it had a `::`-delimited suffix after that (e.g. an `fpd_XXXXXXXX::` specialcode), one `::` survives in the middle. Either way: never write a custom resolver handler that requires a trailing `::` to parse correctly — split the string on `::` and match tokens by position instead. See [docs/resolvers.md](docs/resolvers.md) for the full explanation and both handlers (`local_blob`, `local_lba`) that already do this correctly.
 - **TLS** — `NODE_TLS_REJECT_UNAUTHORIZED=0` for tqnn.local only. Remove for any public HTTPS DMM endpoint with a valid cert.
