@@ -244,15 +244,54 @@ server.tool(
     text: z.string().describe('Free text to find similar documents for. Can be a question, sentence, paragraph, or keyword list.'),
     threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within.'),
-    fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Recommended to leave on.'),
+    pqr: z.boolean().default(true).optional().describe('PQR-hash each token before searching. Default true. Set false to run plain (unhashed) similarity search — for records stored via tqnn_store pqr:false. Equivalent to calling tqnn_similarity_plain. Forces fpd off when false (there is no hash to reverse).'),
+    fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Recommended to leave on. Ignored, and reported as false, when pqr:false.'),
     max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.')
   },
-  async ({ text, threshold = 0.4, dataset, fpd = true, max_results = 20 }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20 }) => {
     try {
       const result = await similaritySearch(client, text, {
         threshold,
         dataset: dataset || CONFIG.dataset,
+        pqr,
         fpd,
+        maxResults: max_results
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }],
+        isError: true
+      };
+    }
+  }
+);
+
+// ── Tool: tqnn_similarity_plain ─────────────────────────────────────────────────
+// Same weighted-overlap algorithm as tqnn_similarity, always in plain (unhashed)
+// mode — equivalent to tqnn_similarity with pqr:false, exposed as its own tool
+// for callers who want an explicitly plaintext-only entry point without needing
+// to know the pqr flag exists. Works against data stored via tqnn_store pqr:false
+// (or, per storeDoc.php's own tokenising, any data at all — DMM tokenises and
+// keys every value server-side regardless of how it was submitted).
+server.tool(
+  'tqnn_similarity_plain',
+  'Find documents in TQNN DMM that are similar to free-text input, using plain (unhashed) associative token overlap scoring. Same algorithm as tqnn_similarity, but searches raw tokens directly with no PQR hashing and no False Positive Defence — use for data stored via tqnn_store pqr:false, or when you specifically want plaintext-only search. Equivalent to tqnn_similarity with pqr:false.',
+  {
+    text: z.string().describe('Free text to find similar documents for. Can be a question, sentence, paragraph, or keyword list.'),
+    threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
+    dataset: z.string().optional().describe('Optional: target dataset/namespace to search within.'),
+    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.')
+  },
+  async ({ text, threshold = 0.4, dataset, max_results = 20 }) => {
+    try {
+      const result = await similaritySearch(client, text, {
+        threshold,
+        dataset: dataset || CONFIG.dataset,
+        pqr: false,
+        fpd: false,
         maxResults: max_results
       });
       return {
