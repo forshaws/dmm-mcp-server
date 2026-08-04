@@ -23,6 +23,7 @@ const fs      = require('fs');
 const path    = require('path');
 const crypto  = require('crypto');
 const zlib    = require('zlib');
+const { lookupChunk } = require('./chunk-index');
 
 // ---------------------------------------------------------------------------
 // Config loader
@@ -121,11 +122,31 @@ function matchResolver(ref, resolvers) {
   // Always check explicit named schemes first (longest match), regardless of logical/non-logical.
   // This allows memory://, glacier://, or any developer-defined non-logical scheme
   // to be explicitly handled without falling through to the * catch-all.
+  // Entries with an id_pattern (see below) aren't real prefix schemes, so they're
+  // excluded here and checked separately.
   const named = [...resolvers]
-    .filter(r => r.scheme !== '*')
+    .filter(r => r.scheme !== '*' && !r.id_pattern)
     .sort((a, b) => b.scheme.length - a.scheme.length);
   const explicit = named.find(r => ref.startsWith(r.scheme));
   if (explicit) return explicit;
+
+  // Pattern-matched resolvers — for filereferences with no logical namespace
+  // prefix at all (e.g. bare chunk_id values returned by TOR's token-link
+  // lookups), matched by shape (id_pattern regex) instead of a literal
+  // prefix. Checked after explicit prefix schemes (so a real "records_..."
+  // ref is never hijacked by a loose pattern) and before the logical/'*'
+  // catch-all fallback (so these never silently fall through to a generic
+  // webhook). First match wins — keep id_pattern entries mutually exclusive.
+  const patterned = resolvers.filter(r => r.id_pattern);
+  for (const r of patterned) {
+    let re;
+    try {
+      re = new RegExp(r.id_pattern);
+    } catch {
+      continue; // malformed regex in config — skip rather than crash resolution
+    }
+    if (re.test(ref)) return r;
+  }
 
   if (isLogicalPrefix(ref)) {
     // Logical prefix with no explicit resolver — no match
@@ -310,6 +331,107 @@ async function handleLocalJsonl(ref, operation, resolverConfig) {
       compressed: false,
       line_hint: lineHint || null
     };
+  }
+
+  return unknownOperation(operation);
+}
+
+// ── chunk_index handler ─────────────────────────────────────────────────────
+//
+// For filereferences that are a bare chunk_id with NO logical namespace
+// prefix at all — e.g. the raw chunk_id strings TOR's token-link lookups
+// (getTokenLinks / add_cache_entry_with_links) return, which never carry a
+// "scheme_" or "::" wrapper. These can't be routed by prefix like
+// local_jsonl's records_/bamburgh_ entries, so they're matched by shape
+// (id_pattern in tqnn_resolvers.json) instead — see matchResolver() above.
+//
+// Resolution is O(1): a prebuilt sorted chunk_id -> (byte_offset,
+// byte_length) index (built offline by build_chunk_index.py, loaded and
+// binary-searched by chunk-index.js) gives the exact byte range of that
+// chunk_id's JSON line inside the single unsharded corpus file, so fetch
+// is one fs.readSync at a known offset — no scan, and no need to hold the
+// corpus itself in memory.
+
+async function handleChunkIndex(ref, operation, resolverConfig) {
+  const cfg = resolverConfig.config || {};
+  const corpusPath = cfg.corpus_path;
+  const indexPath = cfg.index_path;
+  const maxBytes = cfg.max_fetch_bytes || 1048576;
+
+  // Strip DMM's ::timestamp suffix if present, and any bare trailing "::" —
+  // this flow's refs normally carry neither, but stay defensive since the
+  // exact wrapping can vary by how the record entered DMM.
+  const chunkId = normaliseRef(ref).replace(/::$/, '');
+
+  if (!corpusPath || !indexPath) {
+    return {
+      status: 'RESOLVER_NOT_CONFIGURED',
+      resolver: 'chunk_index',
+      filereference: ref,
+      message: 'corpus_path and index_path must both be set in this resolver\'s config in tqnn_resolvers.json.'
+    };
+  }
+
+  let coord;
+  try {
+    coord = lookupChunk(indexPath, chunkId);
+  } catch (e) {
+    // e.g. index file exists but isn't sorted — see chunk-index.js
+    return { status: 'ERROR', resolver: 'chunk_index', filereference: ref, message: e.message };
+  }
+
+  if (operation === 'ping') {
+    return { status: coord ? 'AVAILABLE' : 'NOT_FOUND', resolver: 'chunk_index', filereference: ref };
+  }
+
+  if (!coord) return notFound(ref, 'chunk_index');
+
+  if (operation === 'info') {
+    return {
+      status: 'AVAILABLE',
+      resolver: 'chunk_index',
+      filereference: ref,
+      corpus_path: corpusPath,
+      byte_offset: coord.offset,
+      byte_length: coord.length,
+      content_type: 'application/json'
+    };
+  }
+
+  if (operation === 'fetch') {
+    if (coord.length > maxBytes) {
+      return {
+        status: 'TOO_LARGE',
+        resolver: 'chunk_index',
+        filereference: ref,
+        size_bytes: coord.length,
+        max_bytes: maxBytes,
+        message: `Record exceeds max_fetch_bytes (${maxBytes}). Use info to inspect size first.`
+      };
+    }
+
+    let fd;
+    try {
+      fd = fs.openSync(corpusPath, 'r');
+      const buf = Buffer.alloc(coord.length);
+      fs.readSync(fd, buf, 0, coord.length, coord.offset);
+      return {
+        status: 'OK',
+        resolver: 'chunk_index',
+        filereference: ref,
+        content_type: 'application/json',
+        size_bytes: coord.length,
+        encoding: 'utf8',
+        content: buf.toString('utf8'),
+        compressed: false
+      };
+    } catch (e) {
+      return { status: 'ERROR', resolver: 'chunk_index', filereference: ref, message: e.message };
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* already closed / never opened */ }
+      }
+    }
   }
 
   return unknownOperation(operation);
@@ -772,6 +894,7 @@ async function resolverDispatch(filereference, operation) {
     switch (resolver.handler) {
       case 'memory':      return await handleMemory(ref, operation);
       case 'local_jsonl': return await handleLocalJsonl(ref, operation, resolver);
+      case 'chunk_index': return await handleChunkIndex(ref, operation, resolver);
       case 'local_blob':  return await handleLocalBlob(ref, operation, resolver);
       case 'local_lba':   return await handleLocalLba(ref, operation, resolver);
       case 'url':         return await handleUrl(ref, operation, resolver);
