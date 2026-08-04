@@ -164,6 +164,13 @@ function tokenWeight(docCount) {
  * FPD: make TWO searchDoc calls (forward + reversed token), AND the result sets.
  * Only filereferences in BOTH results are genuine.
  *
+ * v1.5.0 — also captures each underlying DMM call's self-reported timing
+ * (time_used, billing_units, fc) so the caller can aggregate it rather than
+ * it being silently dropped, as it was pre-v1.5.0. DMM's raw searchDoc
+ * response already includes these fields (see tqnn-client.js's _post) —
+ * this function previously read only `filelist` off that response and
+ * discarded the rest.
+ *
  * @param {TQNNClient} client
  * @param {string} token
  * @param {boolean} fpd - Enable False Positive Defence (ignored when pqr:false — nothing to reverse)
@@ -171,35 +178,63 @@ function tokenWeight(docCount) {
  * @param {boolean} [pqr=true] - PQR-hash the token before searching. Set false to search the
  *   raw token directly — for records stored via tqnn_store pqr:false (DMM's own storeDoc.php
  *   tokenises/keys every value regardless, so no client-side hashing is needed on this path).
- * @returns {Promise<string[]>} Array of original filereference strings (with timestamp)
+ * @returns {Promise<{refs: string[], calls: Array<{pass: string, time_used: number|null, billing_units: number|null, fc: number|null}>}>}
+ *   refs: original filereference strings (with timestamp), same as pre-v1.5.0's bare return.
+ *   calls: one entry per DMM searchDoc call actually made for this token (1 normally, 2 under FPD).
  */
 async function searchToken(client, token, fpd, dataset, pqr = true) {
+  const calls = [];
+
+  // DMM's raw response carries time_used (seconds), billing_units, fc
+  // (fingerprint-cache size or similar internal counter), and an `energy`
+  // block (energy_usage_kWh, carbon_emissions_mg, equivalent_meters_driven)
+  // alongside filelist — pull out the timing/billing/energy fields here,
+  // defensively, since older DMM versions or the memory:// in-process path
+  // may not set them all.
+  function recordCall(pass, dmmResult) {
+    const e = dmmResult.energy || {};
+    calls.push({
+      pass,
+      time_used: typeof dmmResult.time_used === 'number' ? dmmResult.time_used : null,
+      billing_units: typeof dmmResult.billing_units === 'number' ? dmmResult.billing_units : null,
+      fc: typeof dmmResult.fc === 'number' ? dmmResult.fc : null,
+      energy_usage_kWh: e.energy_usage_kWh !== undefined ? Number(e.energy_usage_kWh) : null,
+      carbon_emissions_mg: e.carbon_emissions_mg !== undefined ? Number(e.carbon_emissions_mg) : null,
+      equivalent_meters_driven: e.equivalent_meters_driven !== undefined ? Number(e.equivalent_meters_driven) : null
+    });
+  }
+
   if (!pqr) {
     // Plain mode — no hashing, no FPD (there's no hash to reverse against).
     const fwdResult = await client.searchDoc(token, dataset);
+    recordCall('forward_plain', fwdResult);
     const fwdRefs = new Map();
     for (const ref of parseFilelist(fwdResult)) {
       fwdRefs.set(stripTimestamp(ref), ref);
     }
-    return [...fwdRefs.values()];
+    return { refs: [...fwdRefs.values()], calls };
   }
 
   const fwdResult = await client.searchDoc(pqrHash(token), dataset);
+  recordCall('forward', fwdResult);
   const fwdRefs = new Map(); // stripped → original
   for (const ref of parseFilelist(fwdResult)) {
     fwdRefs.set(stripTimestamp(ref), ref);
   }
 
-  if (!fpd) return [...fwdRefs.values()];
+  if (!fpd) return { refs: [...fwdRefs.values()], calls };
 
   // FPD: reverse the token INPUT string, hash it, search again
   const revResult = await client.searchDoc(pqrHashReversed(token), dataset);
+  recordCall('reverse', revResult);
   const revStripped = new Set(parseFilelist(revResult).map(stripTimestamp));
 
   // Only refs present in BOTH forward AND reverse searches are genuine
-  return [...fwdRefs.entries()]
+  const refs = [...fwdRefs.entries()]
     .filter(([stripped]) => revStripped.has(stripped))
     .map(([, orig]) => orig);
+
+  return { refs, calls };
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +288,14 @@ async function similaritySearch(client, text, {
       pqr,
       fpd: effectiveFpd,
       results: [],
+      timing: {
+        wall_clock_ms: 0,
+        dmm_time_used_total_sec: 0,
+        dmm_billing_units_total: 0,
+        dmm_calls_made: 0,
+        energy: null,
+        per_token: []
+      },
       message: 'No searchable tokens found in input text.'
     };
   }
@@ -263,16 +306,51 @@ async function similaritySearch(client, text, {
   let searched = 0;
   let totalWeight = 0;          // sum of weights for all successfully searched tokens — denominator for threshold
 
+  // Timing aggregation (v1.5.0) — wall_clock_ms is measured client-side around
+  // the whole orchestration loop (so it includes network round-trips AND any
+  // client-side processing between calls); dmm_time_used_total_sec sums each
+  // individual searchDoc response's self-reported time_used (server-side
+  // processing time only, no network). The gap between the two is a rough
+  // proxy for network/orchestration overhead vs DMM-side compute.
+  const wallClockStart = Date.now();
+  let dmmTimeUsedTotal = 0;
+  let dmmBillingUnitsTotal = 0;
+  let dmmCallsMade = 0;
+  let energyKWhTotal = 0;
+  let carbonMgTotal = 0;
+  let metersDrivenTotal = 0;
+  let energyDataSeen = false; // becomes true if ANY call reported energy — older DMM versions may not
+  const perTokenTiming = [];
+
   for (const token of tokens) {
-    let refs;
+    let searchResult;
     try {
-      refs = await searchToken(client, token, effectiveFpd, dataset, pqr);
+      searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
     } catch (err) {
       // Log and continue — one failed token shouldn't abort the whole search
       process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
       continue;
     }
     searched++;
+
+    const { refs, calls } = searchResult;
+    let tokenTimeUsed = 0;
+    for (const c of calls) {
+      dmmCallsMade++;
+      if (typeof c.time_used === 'number') {
+        dmmTimeUsedTotal += c.time_used;
+        tokenTimeUsed += c.time_used;
+      }
+      if (typeof c.billing_units === 'number') dmmBillingUnitsTotal += c.billing_units;
+      if (c.energy_usage_kWh !== null) { energyDataSeen = true; energyKWhTotal += c.energy_usage_kWh; }
+      if (c.carbon_emissions_mg !== null) { energyDataSeen = true; carbonMgTotal += c.carbon_emissions_mg; }
+      if (c.equivalent_meters_driven !== null) { energyDataSeen = true; metersDrivenTotal += c.equivalent_meters_driven; }
+    }
+    perTokenTiming.push({
+      token,
+      calls,
+      token_time_used_sec: Math.round(tokenTimeUsed * 1000) / 1000
+    });
 
     const docCount = refs.length;
     const weight = weighted ? tokenWeight(docCount) : 1;
@@ -289,6 +367,8 @@ async function similaritySearch(client, text, {
       }
     }
   }
+
+  const wallClockMs = Date.now() - wallClockStart;
 
   const cutoff = totalWeight * threshold;
   const matched = [...docScores.entries()]
@@ -311,6 +391,18 @@ async function similaritySearch(client, text, {
     pqr,
     fpd: effectiveFpd,
     token_weights: tokenInfo, // per-token doc frequency + weight, for auditability
+    timing: {
+      wall_clock_ms: wallClockMs,
+      dmm_time_used_total_sec: Math.round(dmmTimeUsedTotal * 1000) / 1000,
+      dmm_billing_units_total: dmmBillingUnitsTotal,
+      dmm_calls_made: dmmCallsMade,
+      energy: energyDataSeen ? {
+        energy_usage_kWh: energyKWhTotal,
+        carbon_emissions_mg: carbonMgTotal,
+        equivalent_meters_driven: metersDrivenTotal
+      } : null,
+      per_token: perTokenTiming
+    },
     results: matched
   };
 }
