@@ -23,6 +23,16 @@
 //   still exact-token, still fully client-side, still fully auditable.
 //   No new DMM calls are introduced; document frequency is derived from
 //   the same searchDoc responses already being made.
+//
+// v1.6.0 — Optional parallel per-token search
+//   Per-token searchDoc() calls (one per query token, two under FPD) were
+//   always made one-at-a-time in a `for...await` loop, so wall-clock time
+//   scaled roughly linearly with token count. New `parallel` option (off
+//   by default) fires all tokens' searches concurrently via Promise.all,
+//   then folds results back into the same accumulators in original token
+//   order — output (scores, ranking, diagnostics) is identical to the
+//   sequential path either way; only the number of concurrent HTTP calls
+//   to the DMM appliance changes. No change to the scoring algorithm.
 
 const crypto = require('crypto');
 const { tokenise } = require('./tokeniser');
@@ -266,6 +276,18 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
  * @param {boolean} [options.pqr=true] - PQR-hash each token before searching. Set false for
  *   plain/unhashed similarity search — matches records stored with tqnn_store pqr:false.
  *   When false, fpd is forced off regardless of what was passed (no hash to reverse).
+ * @param {boolean} [options.parallel=false] - Fire each token's searchToken() call
+ *   concurrently (Promise.all) instead of one-at-a-time. Off by default so existing
+ *   callers/behaviour are unchanged. Purely a wall-clock optimisation for multi-token
+ *   queries — does NOT change which documents match, their scores, or their final
+ *   order; per-token accumulation (docScores, docHits, tokenInfo, perTokenTiming) is
+ *   still applied in original token order once all calls have settled, so results are
+ *   byte-identical to the sequential path. Each token's own forward/reverse (FPD) pair
+ *   still runs sequentially within searchToken — only different tokens run concurrently
+ *   with each other. NOTE: this increases simultaneous load on the DMM appliance
+ *   (up to tokens.length concurrent HTTP calls) — worth a quick check that the target
+ *   appliance handles concurrent searchDoc requests cleanly before relying on this in
+ *   production, especially on constrained hardware (e.g. the Pi5).
  * @returns {Promise<SimilarityResult>}
  */
 async function similaritySearch(client, text, {
@@ -274,7 +296,8 @@ async function similaritySearch(client, text, {
   fpd = true,
   maxResults = 20,
   weighted = true,
-  pqr = true
+  pqr = true,
+  parallel = false
 } = {}) {
   const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
@@ -287,6 +310,7 @@ async function similaritySearch(client, text, {
       weighted,
       pqr,
       fpd: effectiveFpd,
+      parallel,
       results: [],
       timing: {
         wall_clock_ms: 0,
@@ -322,18 +346,14 @@ async function similaritySearch(client, text, {
   let energyDataSeen = false; // becomes true if ANY call reported energy — older DMM versions may not
   const perTokenTiming = [];
 
-  for (const token of tokens) {
-    let searchResult;
-    try {
-      searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
-    } catch (err) {
-      // Log and continue — one failed token shouldn't abort the whole search
-      process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
-      continue;
-    }
+  // Fold one token's already-resolved {refs, calls} into the shared
+  // accumulators (docScores, docHits, tokenInfo, perTokenTiming, and the
+  // running timing/energy totals). Called in original token order for both
+  // the sequential and parallel paths, so output is identical either way —
+  // `parallel` only changes when the underlying searchToken() calls are
+  // fired relative to each other, never how their results are combined.
+  function accumulateToken(token, refs, calls) {
     searched++;
-
-    const { refs, calls } = searchResult;
     let tokenTimeUsed = 0;
     for (const c of calls) {
       dmmCallsMade++;
@@ -368,6 +388,39 @@ async function similaritySearch(client, text, {
     }
   }
 
+  if (parallel) {
+    // Fire every token's searchToken() concurrently. A per-token failure
+    // still shouldn't abort the whole search, so failures are caught
+    // per-promise (not via Promise.all's fail-fast behaviour) and resolved
+    // to a sentinel that accumulateToken() below simply skips.
+    const settled = await Promise.all(tokens.map(async (token) => {
+      try {
+        const searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
+        return { token, ok: true, searchResult };
+      } catch (err) {
+        process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
+        return { token, ok: false };
+      }
+    }));
+
+    for (const entry of settled) {
+      if (!entry.ok) continue;
+      accumulateToken(entry.token, entry.searchResult.refs, entry.searchResult.calls);
+    }
+  } else {
+    for (const token of tokens) {
+      let searchResult;
+      try {
+        searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
+      } catch (err) {
+        // Log and continue — one failed token shouldn't abort the whole search
+        process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
+        continue;
+      }
+      accumulateToken(token, searchResult.refs, searchResult.calls);
+    }
+  }
+
   const wallClockMs = Date.now() - wallClockStart;
 
   const cutoff = totalWeight * threshold;
@@ -390,6 +443,7 @@ async function similaritySearch(client, text, {
     weighted,
     pqr,
     fpd: effectiveFpd,
+    parallel,
     token_weights: tokenInfo, // per-token doc frequency + weight, for auditability
     timing: {
       wall_clock_ms: wallClockMs,

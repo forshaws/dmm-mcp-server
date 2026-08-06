@@ -247,16 +247,18 @@ server.tool(
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within.'),
     pqr: z.boolean().default(true).optional().describe('PQR-hash each token before searching. Default true. Set false to run plain (unhashed) similarity search — for records stored via tqnn_store pqr:false. Equivalent to calling tqnn_similarity_plain. Forces fpd off when false (there is no hash to reverse).'),
     fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Recommended to leave on. Ignored, and reported as false, when pqr:false.'),
-    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.')
+    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
+    parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20 }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false }) => {
     try {
       const result = await similaritySearch(client, text, {
         threshold,
         dataset: dataset || CONFIG.dataset,
         pqr,
         fpd,
-        maxResults: max_results
+        maxResults: max_results,
+        parallel
       });
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -284,16 +286,18 @@ server.tool(
     text: z.string().describe('Free text to find similar documents for. Can be a question, sentence, paragraph, or keyword list.'),
     threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within.'),
-    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.')
+    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
+    parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.')
   },
-  async ({ text, threshold = 0.4, dataset, max_results = 20 }) => {
+  async ({ text, threshold = 0.4, dataset, max_results = 20, parallel = false }) => {
     try {
       const result = await similaritySearch(client, text, {
         threshold,
         dataset: dataset || CONFIG.dataset,
         pqr: false,
         fpd: false,
-        maxResults: max_results
+        maxResults: max_results,
+        parallel
       });
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -326,16 +330,17 @@ server.tool(
 // non-tied results — only reorders within exact ties.
 server.tool(
   'tqnn_similarity_ranked',
-  'Same as tqnn_similarity, but when many results tie at the same similarity score (common on short/specific queries where everything fully matches), reorders results within each tied group using precomputed citation-shape statistics so bibliography/citation-list chunks sort behind genuine prose content. Requires a one-time offline ranking build per dataset (build_shard_ranking_metadata.py) — falls back to identical behaviour as tqnn_similarity, with ranking_available:false, if no ranking data exists for the target dataset.',
+  'Same as tqnn_similarity, but when many results tie at the same similarity score (common on short/specific queries where everything fully matches), reorders results within each tied group using precomputed citation-shape statistics so bibliography/citation-list chunks sort behind genuine prose content. Requires a one-time offline ranking build per dataset (build_shard_ranking_metadata.py) — falls back to identical behaviour as tqnn_similarity, with ranking_available:false, if no ranking data exists for the target dataset. Supports parallel:true to search all query tokens concurrently for faster wall-clock time on multi-token queries.',
   {
     text: z.string().describe('Free text to find similar documents for. Can be a question, sentence, paragraph, or keyword list.'),
     threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within. Also used to locate this dataset\'s ranking file, if one exists.'),
     pqr: z.boolean().default(true).optional().describe('PQR-hash each token before searching. Default true. Set false for plain (unhashed) search — forces fpd off when false.'),
     fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Ignored, and reported as false, when pqr:false.'),
-    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.')
+    max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
+    parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way (citation-shape reranking is unaffected) — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20 }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
       const result = await similaritySearch(client, text, {
@@ -343,7 +348,8 @@ server.tool(
         dataset: targetDataset,
         pqr,
         fpd,
-        maxResults: max_results
+        maxResults: max_results,
+        parallel
       });
 
       const { results: rerankedResults, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
