@@ -288,6 +288,17 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
  *   (up to tokens.length concurrent HTTP calls) — worth a quick check that the target
  *   appliance handles concurrent searchDoc requests cleanly before relying on this in
  *   production, especially on constrained hardware (e.g. the Pi5).
+ * @param {boolean} [options.truncate=true] - Slice the above-threshold, sorted match
+ *   set down to `maxResults` before returning. Default true preserves existing
+ *   behaviour for tqnn_similarity/tqnn_similarity_plain exactly. Callers that need to
+ *   apply their own reordering over the FULL above-threshold pool before truncating
+ *   (e.g. tqnn_similarity_ranked's citation-shape reranking) should pass false and
+ *   truncate the result themselves after reordering — otherwise a downstream reorder
+ *   only ever sees whichever arbitrary subset happened to survive this internal slice,
+ *   not the true top-N by their own criteria. No extra DMM calls or compute are
+ *   introduced by passing false: the full above-threshold set is already accumulated
+ *   and sorted internally on every call regardless of `truncate` — this option only
+ *   changes whether the tail gets cut here or left for the caller.
  * @returns {Promise<SimilarityResult>}
  */
 async function similaritySearch(client, text, {
@@ -297,7 +308,8 @@ async function similaritySearch(client, text, {
   maxResults = 20,
   weighted = true,
   pqr = true,
-  parallel = false
+  parallel = false,
+  truncate = true
 } = {}) {
   const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
@@ -424,10 +436,11 @@ async function similaritySearch(client, text, {
   const wallClockMs = Date.now() - wallClockStart;
 
   const cutoff = totalWeight * threshold;
-  const matched = [...docScores.entries()]
+  const aboveThreshold = [...docScores.entries()]
     .filter(([, score]) => score >= cutoff)
-    .sort((a, b) => b[1] - a[1]) // highest weighted score first
-    .slice(0, maxResults)
+    .sort((a, b) => b[1] - a[1]); // highest weighted score first
+
+  const matched = (truncate ? aboveThreshold.slice(0, maxResults) : aboveThreshold)
     .map(([ref, score]) => ({
       filereference: ref,
       token_hits: docHits.get(ref) || 0,
@@ -439,6 +452,7 @@ async function similaritySearch(client, text, {
     tokens_used: tokens,
     tokens_searched: searched,
     matches_found: matched.length,
+    total_matches_above_threshold: aboveThreshold.length,
     threshold_pct: threshold * 100,
     weighted,
     pqr,
