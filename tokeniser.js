@@ -4,13 +4,44 @@
 // V1.4.0 — Pruned medical stopwords that carry clinical signal (severity, laterality,
 //   chronicity, diagnostic category); added ACRONYM_ALLOWLIST so short but meaningful
 //   domain tokens (MRI, CT, PET, ...) survive MIN_TOKEN_LENGTH.
+// V1.5.0 — Merged in DOMAIN_FILTER_STOPWORDS (the ingest-side stopword list used by
+//   build_shard_tokens_biblio.py / count_unique_tokens.py / sample_surviving_tokens.py
+//   at store time) as a superset of this query-side list. Root-caused via the
+//   2026-08-07 130-query benchmark: "before" and "through" were filtered out of the
+//   index at ingest time but NOT filtered from queries here, so any query containing
+//   either word was structurally guaranteed docCount=0 for that token, regardless of
+//   corpus content — this alone accounted for 7 of 8 zero-match queries in that
+//   benchmark, including every "technique" intent query ("what imaging is needed
+//   before [procedure]"). Query-side only, no re-ingest needed. Checked against the
+//   V1.4.0 clinical-modifier exceptions (disease, disorder, syndrome, familial, acute,
+//   chronic, severe, mild, moderate, bilateral, unilateral, left, right, early, late,
+//   primary, secondary) — none of them appear in DOMAIN_FILTER_STOPWORDS, so no
+//   conflict; those terms remain un-stopworded exactly as before.
 
 const STOPWORDS = new Set([
-  // Generic English stopwords
-  "this", "that", "with", "from", "they", "them", "their", "what",
-  "will", "have", "been", "were", "when", "where", "which", "there",
-  "some", "more", "also", "than", "then", "into", "your", "about",
-  "would", "could", "should", "each", "other", "these", "those",
+  // Generic English stopwords (merged superset of the original hand-curated
+  // list here and DOMAIN_FILTER_STOPWORDS from build_shard_tokens_biblio.py —
+  // see V1.5.0 note above)
+  "a", "about", "after", "again", "all", "also", "an", "and", "any", "are", "as", "at",
+  "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+  "can", "could", "did", "do", "does", "doing", "down", "during",
+  "each", "few", "for", "from", "further",
+  "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him",
+  "himself", "his", "how",
+  "i", "if", "in", "into", "is", "it", "its", "itself",
+  "just",
+  "may", "me", "might", "more", "most", "must", "my", "myself",
+  "no", "nor", "not", "now",
+  "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out",
+  "over", "own",
+  "same", "she", "should", "so", "some", "such",
+  "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there",
+  "these", "they", "this", "those", "through", "to", "too",
+  "under", "until", "up",
+  "very",
+  "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
+  "will", "with", "would",
+  "you", "your", "yours", "yourself", "yourselves",
   // Domain-neutral common words
   "data", "file", "document", "record", "report", "system", "user",
   "type", "date", "time", "name", "list", "item", "value", "field",
@@ -21,8 +52,8 @@ const STOPWORDS = new Set([
   // sentence, and stripping them discards clinically decisive information
   // — e.g. "severe" vs "mild" or "bilateral" vs "unilateral" can point to
   // different diagnoses entirely. Retained only genuinely structural terms.
-  "stage", "with", "and", "the", "due", "related",
-  "associated", "onset"
+  // (with/and/the already covered by the merged generic list above.)
+  "stage", "due", "related", "associated", "onset"
 ]);
 
 // Short (< MIN_TOKEN_LENGTH) tokens that are still meaningful and should not
