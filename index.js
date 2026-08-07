@@ -49,7 +49,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
 const { similaritySearch, pqrHash, pqrHashReversed, tokenise, stripTimestamp } = require('./similarity');
-const { applyCitationShapeRanking } = require('./ranking');
+const { applyCitationShapeRanking, applySourceCap } = require('./ranking');
 const { OAuthServer, readBody } = require('./oauth');
 const { resolverDispatch, registerMemory } = require('./resolver');
 const fs   = require('fs');
@@ -330,7 +330,7 @@ server.tool(
 // non-tied results — only reorders within exact ties.
 server.tool(
   'tqnn_similarity_ranked',
-  'Same as tqnn_similarity, but when many results tie at the same similarity score (common on short/specific queries where everything fully matches), reorders results within each tied group using precomputed citation-shape statistics so bibliography/citation-list chunks sort behind genuine prose content. Requires a one-time offline ranking build per dataset (build_shard_ranking_metadata.py) — falls back to identical behaviour as tqnn_similarity, with ranking_available:false, if no ranking data exists for the target dataset. Supports parallel:true to search all query tokens concurrently for faster wall-clock time on multi-token queries.',
+  'Same as tqnn_similarity, but when many results tie at the same similarity score (common on short/specific queries where everything fully matches), reorders results within each tied group using precomputed citation-shape statistics so bibliography/citation-list chunks sort behind genuine prose content. Requires a one-time offline ranking build per dataset (build_shard_ranking_metadata.py) — falls back to identical behaviour as tqnn_similarity, with ranking_available:false, if no ranking data exists for the target dataset. Supports parallel:true to search all query tokens concurrently for faster wall-clock time on multi-token queries. Supports max_per_source to cap how many results can come from any single source document, preventing one large/thorough paper from crowding out other relevant sources.',
   {
     text: z.string().describe('Free text to find similar documents for. Can be a question, sentence, paragraph, or keyword list.'),
     threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
@@ -338,9 +338,10 @@ server.tool(
     pqr: z.boolean().default(true).optional().describe('PQR-hash each token before searching. Default true. Set false for plain (unhashed) search — forces fpd off when false.'),
     fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Ignored, and reported as false, when pqr:false.'),
     max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
-    parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way (citation-shape reranking is unaffected) — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.')
+    parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way (citation-shape reranking is unaffected) — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.'),
+    max_per_source: z.number().int().min(0).max(100).default(0).optional().describe('Cap on how many results may come from any single source document (grouped by source_id in the ranking data). 0 (default) = uncapped, identical behaviour to not passing this parameter at all. When >0, results from a source beyond the cap are pushed behind other results (never dropped) and tagged source_capped:true — a large enough max_results will still surface them. Requires ranking data (same offline build as citation-shape reranking); has no effect when ranking_available is false.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0 }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
       // truncate:false — pull the FULL above-threshold pool, not just the first
@@ -361,19 +362,29 @@ server.tool(
 
       const { results: rerankedFull, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
 
-      // Truncate AFTER reranking, so max_results reflects the true top-N by
-      // citation-shape order rather than an arbitrary pre-ranking slice.
-      const rerankedResults = rerankedFull.slice(0, max_results);
-
       // top_score_tied_count / fully_ranked: cheap diagnostics computed off
-      // the full reranked pool, so callers can tell whether a tie extended
-      // past max_results (i.e. whether truncation cut through a tied group)
-      // rather than silently guessing from matches_found alone.
+      // the full CITATION-SHAPE-reranked pool, before source capping —
+      // these describe whether a genuine weighted_score tie extended past
+      // max_results, which is unrelated to and unaffected by source
+      // concentration, so they're measured at this point regardless of
+      // whether max_per_source is used.
       const topScore = rerankedFull.length > 0 ? rerankedFull[0].weighted_score : null;
       const topScoreTiedCount = topScore === null
         ? 0
         : rerankedFull.filter(r => r.weighted_score === topScore).length;
       const fullyRanked = topScoreTiedCount <= max_results;
+
+      // Source cap runs AFTER citation-shape reranking, across the whole
+      // pool (not scoped to individual tie groups — see applySourceCap's
+      // own doc comment for why). max_per_source:0 (default) is a no-op
+      // that just tags every result source_capped:false, so this is safe
+      // to call unconditionally.
+      const sourceCappedFull = applySourceCap(rerankedFull, max_per_source);
+
+      // Truncate AFTER both reranking passes, so max_results reflects the
+      // true top-N by citation-shape order AND source-cap order, rather
+      // than an arbitrary pre-ranking slice.
+      const rerankedResults = sourceCappedFull.slice(0, max_results);
 
       return {
         content: [{
@@ -384,7 +395,8 @@ server.tool(
             matches_found: rerankedResults.length,
             top_score_tied_count: topScoreTiedCount,
             fully_ranked: fullyRanked,
-            ranking_available
+            ranking_available,
+            max_per_source: max_per_source || null
           }, null, 2)
         }]
       };
