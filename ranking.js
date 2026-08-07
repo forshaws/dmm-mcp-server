@@ -31,7 +31,13 @@
 // Ranking data is precomputed OFFLINE per dataset by
 // build_shard_ranking_metadata.py, run once against a dataset's corpus
 // shards. Output is a flat, pipe-delimited file:
-//     chunk_id|dd|cwr|pd|ent
+//     chunk_id|dd|cwr|pd|ent|source_id
+// (source_id added — see applySourceCap() below — a short hash of the
+// chunk's source document title, used to cap how many chunks from one
+// document can occupy a result set. Older .rank files without a 6th
+// field still parse fine; source_id is simply undefined for those rows,
+// and applySourceCap() treats any result with no source_id as ungroupable
+// and passes it through uncapped.)
 // stored per-dataset (this deployment model is one MCP server instance
 // per user/dataset, so there is normally at most one ranking file
 // relevant to a given running server — but the loader is dataset-keyed
@@ -64,20 +70,26 @@ function isSafeDatasetName(dataset) {
 }
 
 /**
- * Parse one line of a .rank file into a metadata object.
- * @param {string} line - "chunk_id|dd|cwr|pd|ent"
- * @returns {{chunk_id: string, dd: number, cwr: number, pd: number, ent: number} | null}
+ * Parse one line of a .rank file into a metadata object. Accepts both the
+ * original 5-field format (chunk_id|dd|cwr|pd|ent) and the newer 6-field
+ * format with source_id appended, so a server can be pointed at an older
+ * .rank file without regenerating it — source_id simply comes back
+ * undefined in that case, and applySourceCap() treats that as "can't
+ * group this one" rather than erroring.
+ * @param {string} line - "chunk_id|dd|cwr|pd|ent" or "chunk_id|dd|cwr|pd|ent|source_id"
+ * @returns {{chunk_id: string, dd: number, cwr: number, pd: number, ent: number, source_id: string|undefined} | null}
  */
 function parseRankLine(line) {
   const parts = line.split('|');
-  if (parts.length !== 5) return null;
-  const [chunk_id, dd, cwr, pd, ent] = parts;
+  if (parts.length !== 5 && parts.length !== 6) return null;
+  const [chunk_id, dd, cwr, pd, ent, source_id] = parts;
   return {
     chunk_id,
     dd: parseFloat(dd),
     cwr: parseFloat(cwr),
     pd: parseFloat(pd),
-    ent: parseFloat(ent)
+    ent: parseFloat(ent),
+    source_id: source_id || undefined
   };
 }
 
@@ -202,7 +214,7 @@ function applyCitationShapeRanking(results, dataset) {
     const chunkId = filereferenceToChunkId(r.filereference);
     const entry = ranking_available ? table.get(chunkId) : undefined;
     if (!entry) {
-      return { ...r, citation_shape: null };
+      return { ...r, citation_shape: null, source_id: null };
     }
     return {
       ...r,
@@ -212,7 +224,8 @@ function applyCitationShapeRanking(results, dataset) {
         pd: entry.pd,
         ent: entry.ent,
         score: Math.round(citationShapeScore(entry) * 1000) / 1000
-      }
+      },
+      source_id: entry.source_id || null
     };
   });
 
@@ -267,12 +280,74 @@ function applyCitationShapeRanking(results, dataset) {
   return { results: reranked, ranking_available: true };
 }
 
+/**
+ * Cap how many results from any single source document (by source_id) can
+ * appear before others are pushed behind them — addressing a distinct
+ * problem from exact-duplicate suppression above: even with zero
+ * byte-identical chunks, a single large/thorough paper can legitimately
+ * out-score enough of its own chunks to fill most of a result set (e.g.
+ * observed 2026-08-07: one paper alone took 4 of 10 slots on
+ * staging_01/clinical_decision_08, all ~90-100% topically relevant, just
+ * heavily concentrated in one source with overlapping adjacent chunks).
+ *
+ * Unlike the tie-group-scoped exact-duplicate handling in
+ * applyCitationShapeRanking(), this cap is applied across the WHOLE
+ * result list in its already-reranked order (call this AFTER
+ * applyCitationShapeRanking, before truncating to max_results) — the
+ * over-concentration this addresses isn't confined to a single tied
+ * score group.
+ *
+ * Same non-destructive design as the exact-duplicate fix: nothing is
+ * removed. Results kept under the cap stay in their existing order;
+ * results that would exceed the cap for their source_id are moved behind
+ * every kept result (preserving their relative order among themselves)
+ * and tagged `source_capped: true`, so a caller with a large enough
+ * max_results still sees them, and the effect is auditable rather than
+ * silent. Results with no source_id (missing ranking data, or an older
+ * 5-field .rank file — see parseRankLine) are never capped, since there
+ * is no basis to group them with anything.
+ *
+ * @param {object[]} results - Output of applyCitationShapeRanking's `results`
+ *   (each entry already carries `source_id`, or null/undefined if unavailable)
+ * @param {number} [maxPerSource=0] - Max results allowed per source_id.
+ *   0 or falsy = uncapped, returns results unchanged (with source_capped:false
+ *   tagged on every entry for a consistent shape) — this is the default, so
+ *   existing callers that don't pass max_per_source see no behaviour change.
+ * @returns {object[]}
+ */
+function applySourceCap(results, maxPerSource = 0) {
+  if (!maxPerSource || maxPerSource <= 0) {
+    return results.map(r => ({ ...r, source_capped: false }));
+  }
+
+  const counts = new Map(); // source_id -> count kept so far
+  const kept = [];
+  const deferred = [];
+
+  for (const r of results) {
+    if (!r.source_id) {
+      kept.push({ ...r, source_capped: false });
+      continue;
+    }
+    const count = counts.get(r.source_id) || 0;
+    if (count < maxPerSource) {
+      counts.set(r.source_id, count + 1);
+      kept.push({ ...r, source_capped: false });
+    } else {
+      deferred.push({ ...r, source_capped: true });
+    }
+  }
+
+  return [...kept, ...deferred];
+}
+
 module.exports = {
   loadRankingTable,
   filereferenceToChunkId,
   citationShapeScore,
   exactDuplicateKey,
   applyCitationShapeRanking,
+  applySourceCap,
   isSafeDatasetName,
   RANKING_DIR
 };
