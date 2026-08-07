@@ -343,16 +343,37 @@ server.tool(
   async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
+      // truncate:false — pull the FULL above-threshold pool, not just the first
+      // max_results found. Citation-shape reranking below needs to see every
+      // tied candidate to pick the true best max_results, not just whichever
+      // arbitrary subset happened to be discovered first. No extra DMM calls
+      // or compute: the full pool is already gathered and sorted internally
+      // regardless of this flag — see similaritySearch()'s `truncate` option.
       const result = await similaritySearch(client, text, {
         threshold,
         dataset: targetDataset,
         pqr,
         fpd,
         maxResults: max_results,
-        parallel
+        parallel,
+        truncate: false
       });
 
-      const { results: rerankedResults, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
+      const { results: rerankedFull, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
+
+      // Truncate AFTER reranking, so max_results reflects the true top-N by
+      // citation-shape order rather than an arbitrary pre-ranking slice.
+      const rerankedResults = rerankedFull.slice(0, max_results);
+
+      // top_score_tied_count / fully_ranked: cheap diagnostics computed off
+      // the full reranked pool, so callers can tell whether a tie extended
+      // past max_results (i.e. whether truncation cut through a tied group)
+      // rather than silently guessing from matches_found alone.
+      const topScore = rerankedFull.length > 0 ? rerankedFull[0].weighted_score : null;
+      const topScoreTiedCount = topScore === null
+        ? 0
+        : rerankedFull.filter(r => r.weighted_score === topScore).length;
+      const fullyRanked = topScoreTiedCount <= max_results;
 
       return {
         content: [{
@@ -360,6 +381,9 @@ server.tool(
           text: JSON.stringify({
             ...result,
             results: rerankedResults,
+            matches_found: rerankedResults.length,
+            top_score_tied_count: topScoreTiedCount,
+            fully_ranked: fullyRanked,
             ranking_available
           }, null, 2)
         }]
