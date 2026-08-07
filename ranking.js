@@ -145,6 +145,25 @@ function citationShapeScore(entry) {
 }
 
 /**
+ * Build a key that is identical for two entries if and only if their
+ * dd/cwr/pd/ent are all identical. Since these four stats are computed
+ * deterministically FROM the chunk's raw text (see the offline
+ * build_shard_ranking_metadata.py step), an exact match on all four is
+ * strong evidence the underlying chunk text is byte-identical — this is
+ * NOT a semantic/near-duplicate check, only exact-duplicate detection
+ * (e.g. the same source PDF ingested twice under different filenames).
+ * A near-duplicate (paraphrased, or a different excerpt of the same
+ * paper) will differ on at least one of these four values and will NOT
+ * be caught here — deliberately conservative, to avoid false positives
+ * suppressing genuinely distinct content.
+ * @param {{dd:number,cwr:number,pd:number,ent:number}} shape
+ * @returns {string}
+ */
+function exactDuplicateKey(shape) {
+  return `${shape.dd}|${shape.cwr}|${shape.pd}|${shape.ent}`;
+}
+
+/**
  * Re-order a tqnn_similarity result set using citation-shape data, WITHOUT
  * changing which documents are included or their primary IDF-weighted
  * ranking. Only reorders WITHIN groups of results that share the exact
@@ -154,6 +173,18 @@ function citationShapeScore(entry) {
  * the augmentation strictly additive and bounded: it cannot make the
  * underlying similarity search's threshold/inclusion decisions worse,
  * only refine ordering within an otherwise-undifferentiated tie.
+ *
+ * Within a tie group, exact-duplicate chunks (identical dd/cwr/pd/ent —
+ * see exactDuplicateKey) are additionally pushed behind every distinct
+ * chunk in that group, keeping only the first (lowest citation-shape
+ * score) copy of each duplicate cluster in its natural position. Nothing
+ * is removed from the result set — a duplicate copy still appears, just
+ * later — so this only "frees a slot" in the sense that a caller who then
+ * truncates to max_results (as tqnn_similarity_ranked does) will prefer
+ * one representative per distinct chunk before spending a slot on a
+ * second copy of one already seen. Each duplicate copy is tagged with
+ * `duplicate_of` (the chunk_id of the kept first occurrence) so this is
+ * auditable rather than silent.
  *
  * Every result gets its citation-shape data attached (or null if
  * unavailable for that chunk) for auditability, regardless of whether
@@ -208,9 +239,27 @@ function applyCitationShapeRanking(results, dataset) {
       const withScore = tieGroup.filter(r => r.citation_shape !== null);
       const withoutScore = tieGroup.filter(r => r.citation_shape === null);
       withScore.sort((a, b) => a.citation_shape.score - b.citation_shape.score);
-      reranked.push(...withScore, ...withoutScore);
+
+      // Exact-duplicate split: first occurrence of each dd/cwr/pd/ent key
+      // stays in its sorted position; repeat occurrences are collected
+      // separately and appended after every distinct chunk in this group.
+      const seenKeys = new Map(); // key -> chunk_id of the kept first occurrence
+      const distinct = [];
+      const duplicates = [];
+      for (const r of withScore) {
+        const key = exactDuplicateKey(r.citation_shape);
+        const firstChunkId = seenKeys.get(key);
+        if (firstChunkId === undefined) {
+          seenKeys.set(key, filereferenceToChunkId(r.filereference));
+          distinct.push({ ...r, duplicate_of: null });
+        } else {
+          duplicates.push({ ...r, duplicate_of: firstChunkId });
+        }
+      }
+
+      reranked.push(...distinct, ...duplicates, ...withoutScore);
     } else {
-      reranked.push(...tieGroup);
+      reranked.push({ ...tieGroup[0], duplicate_of: null });
     }
     i = j;
   }
@@ -222,6 +271,7 @@ module.exports = {
   loadRankingTable,
   filereferenceToChunkId,
   citationShapeScore,
+  exactDuplicateKey,
   applyCitationShapeRanking,
   isSafeDatasetName,
   RANKING_DIR
