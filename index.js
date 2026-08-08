@@ -1,5 +1,5 @@
 // index.js — TQNN DMM MCP Server
-// TQNN MCP Server v1.3.1
+// TQNN MCP Server v1.5.0
 //
 // Exposes TQNN DMM associative memory as MCP tools for Claude and other
 // MCP-compatible LLMs.
@@ -151,7 +151,7 @@ function getClientFor(authResult) {
 function createMcpServer(authResult) {
   const server = new McpServer({
     name: 'tqnn-dmm',
-    version: '1.4.0'
+    version: '1.5.0'
   });
 
   // Resolved once per connection (matches the per-connection McpServer factory
@@ -181,6 +181,51 @@ function createMcpServer(authResult) {
     } catch (err) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ status: 'error', message: err.message }, null, 2) }],
+        isError: true
+      };
+    }
+  }
+);
+
+// ── Tool: tqnn_discover_datasets ────────────────────────────────────────────
+server.tool(
+  'tqnn_discover_datasets',
+  'Discover which datasets are visible to the caller\'s current DMM credential. ' +
+  'For an employee mapped in tqnn_mcp_credentials.json, this reports THEIR sub-credential\'s ' +
+  'ACL whitelist (scope: sub_credential) — the same dataset access enforced on every other ' +
+  'tool call on this connection. For the .env fallback pair (stdio mode, or an unmapped ' +
+  'employee), it reports the owner\'s full namespace (scope: owner). Call this to find out ' +
+  'what a "dataset" argument can legally be set to before calling tqnn_search/tqnn_similarity ' +
+  'with an unfamiliar one, or to self-orient at session start alongside tqnn_status.',
+  {},
+  async () => {
+    try {
+      const result = await client.discoverDatasets();
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            scope: result.scope,
+            label: result.label,
+            datasets: result.datasets,
+            dataset_count: result.dataset_count,
+            default_dataset: result.default_dataset,
+            // default_dataset from the ACL is only ever non-null for a single-dataset
+            // credential. The MCP server's OWN effective default (used by tqnn_status/
+            // ping() and any tool call that omits `dataset`) is resolved separately —
+            // per employee in tqnn_mcp_credentials.json, or CONFIG.dataset (.env
+            // TQNN_DATASET) as the final fallback — never by the ACL. Surface both so
+            // a multi-dataset employee isn't left guessing which one their calls
+            // actually hit when they don't pass `dataset` explicitly.
+            mcp_effective_default_dataset: client.dataset || '(unset — falls through to DMM appliance default)',
+            default_dataset_note: result.default_dataset_note,
+            dmm_response: { code: result.code, type: result.type, message: result.message }
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }],
         isError: true
       };
     }
@@ -649,7 +694,7 @@ async function startSSE() {
       res.end(JSON.stringify({
         status: 'ok',
         server: 'tqnn-mcp-server',
-        version: '1.4.0',
+        version: '1.5.0',
         auth: 'oauth2.1',
         base_url: CONFIG.baseUrl,
         dataset: CONFIG.dataset || '(default)'

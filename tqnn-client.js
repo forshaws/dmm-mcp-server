@@ -1,5 +1,5 @@
 // tqnn-client.js — Core DMM HTTP calls using multipart/form-data
-// TQNN MCP Server v1.3.0
+// TQNN MCP Server v1.5.0
 //
 // All DMM API calls use multipart/form-data, NOT JSON body.
 // Uses Node 18+ built-in FormData + fetch — no extra npm package needed.
@@ -93,6 +93,18 @@ class TQNNClient {
    *   return this._post('/v1/searchDoc', { pattern: pingHash });
    * }
    */
+
+  /**
+   * Discover which datasets the caller's own credentials can access.
+   * Sub-credentials get back their exact ACL whitelist; owner credentials
+   * get back the full dataset list in their namespace.
+   * No dataset param — this call is inherently credential-scoped, not
+   * dataset-scoped (there's nothing to pass).
+   * @returns {Promise<ApiResponse>}
+   */
+  async discoverDatasets() {
+    return this._post('/v1/discoverDatasets', {});
+  }
 
   /**
    * Authenticate credentials against DMM.
