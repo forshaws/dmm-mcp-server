@@ -207,6 +207,7 @@ server.tool(
           text: JSON.stringify({
             scope: result.scope,
             label: result.label,
+            permissions: result.permissions,
             datasets: result.datasets,
             dataset_count: result.dataset_count,
             default_dataset: result.default_dataset,
@@ -219,7 +220,9 @@ server.tool(
             // actually hit when they don't pass `dataset` explicitly.
             mcp_effective_default_dataset: client.dataset || '(unset — falls through to DMM appliance default)',
             default_dataset_note: result.default_dataset_note,
-            dmm_response: { code: result.code, type: result.type, message: result.message }
+            claude_connected: result.claude_connected,
+            claude_model: result.claude_model,
+            dmm_response: result.tqnn_response
           }, null, 2)
         }]
       };
