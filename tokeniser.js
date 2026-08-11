@@ -138,7 +138,19 @@ const ACRONYM_ALLOWLIST = new Set([
   // diagnostic imaging?" lost "HCC" — the one word anchoring the query to
   // a specific disease — leaving only generic scaffolding words, which
   // matched a completely unrelated AI-ethics-in-healthcare review at rank 1.
-  "HCC"
+  "HCC",
+  // Added V1.6.3 — mined from the real corpus (find_short_token_candidates.py,
+  // scanning corpus_full.jsonl's raw text for short tokens appearing fully
+  // uppercase, i.e. genuine acronym usage, not guessed): FDG (fluorodeoxy-
+  // glucose, the PET tracer — docCount 64,095), AUC (area under the curve,
+  // diagnostic-accuracy statistic — 43,738), CI (confidence interval —
+  // 54,372), SD (standard deviation — 38,215), AI (artificial intelligence,
+  // heavily discussed in this corpus — 61,226). Deliberately did NOT add
+  // CA (cancer vs California vs Latin "circa" — genuinely ambiguous), II
+  // (staging notation vs generic roman numeral), or TL (unclear meaning,
+  // needs manual context check) from the same mining run — held back
+  // pending a direct look at real occurrences, not silently dropped.
+  "FDG", "AUC", "CI", "SD", "AI"
 ]);
 
 const MIN_TOKEN_LENGTH = 4;
