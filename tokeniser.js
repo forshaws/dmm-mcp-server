@@ -50,6 +50,21 @@
 //       clinical-frequency vocabulary, not scaffolding; flagged there as
 //       lower-confidence and worth revisiting with real corpus-bloat evidence, so
 //       left as-is here rather than guessed at.
+// V1.6.2 — Added "HCC" to ACRONYM_ALLOWLIST. Found live while diagnosing
+//   guideline_05 ("What do major society guidelines recommend for HCC
+//   surveillance and diagnostic imaging?"): "HCC" — the one word anchoring
+//   the query to a specific disease (hepatocellular carcinoma) — was
+//   silently dropped, same mechanism as the ADC/DWI gap above, leaving only
+//   generic scaffolding words ("society", "guidelines", "surveillance",
+//   "diagnostic", "imaging"). Confirmed live: without it, rank 1 was a
+//   completely unrelated AI-ethics-in-healthcare review that only matched
+//   on those generic words. This was found by diagnosing one specific
+//   failing query, not from a systematic audit — other common short
+//   radiology/oncology acronyms (e.g. RCC, PSA, TIA, AVM) are plausible
+//   candidates for the same gap but are UNVERIFIED — not added here on
+//   guesswork. Worth a real audit against the full 130-query set (or the
+//   corpus's own short-token vocabulary) rather than adding acronyms one
+//   live failure at a time.
 
 const STOPWORDS = new Set([
   // Generic English stopwords (merged superset of the original hand-curated
@@ -117,7 +132,13 @@ const ACRONYM_ALLOWLIST = new Set([
   "PNS", "GI", "GU", "CSF", "WBC", "RBC", "BMD", "DXA", "EMG",
   // Added V1.6.0 — confirmed missing via live benchmark diagnosis
   // (definition_06: "restricted ADC value ... DWI" tokenised to neither).
-  "ADC", "DWI"
+  "ADC", "DWI",
+  // Added V1.6.2 — confirmed missing via live guideline_05 diagnosis:
+  // "What do major society guidelines recommend for HCC surveillance and
+  // diagnostic imaging?" lost "HCC" — the one word anchoring the query to
+  // a specific disease — leaving only generic scaffolding words, which
+  // matched a completely unrelated AI-ethics-in-healthcare review at rank 1.
+  "HCC"
 ]);
 
 const MIN_TOKEN_LENGTH = 4;
