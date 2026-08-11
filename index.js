@@ -387,9 +387,10 @@ server.tool(
     fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Ignored, and reported as false, when pqr:false.'),
     max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
     parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way (citation-shape reranking is unaffected) — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.'),
-    max_per_source: z.number().int().min(0).max(100).default(0).optional().describe('Cap on how many results may come from any single source document (grouped by source_id in the ranking data). 0 (default) = uncapped, identical behaviour to not passing this parameter at all. When >0, results from a source beyond the cap are pushed behind other results (never dropped) and tagged source_capped:true — a large enough max_results will still surface them. Requires ranking data (same offline build as citation-shape reranking); has no effect when ranking_available is false.')
+    max_per_source: z.number().int().min(0).max(100).default(0).optional().describe('Cap on how many results may come from any single source document (grouped by source_id in the ranking data). 0 (default) = uncapped, identical behaviour to not passing this parameter at all. When >0, results from a source beyond the cap are pushed behind other results (never dropped) and tagged source_capped:true — a large enough max_results will still surface them. Requires ranking data (same offline build as citation-shape reranking); has no effect when ranking_available is false.'),
+    weight_power: z.number().min(1).max(4).default(1).optional().describe('EXPERIMENTAL, opt-in. Exponent applied to each token\'s log-dampened IDF weight before summing into weighted_score. Default 1 = current/original behaviour, byte-identical output. Values >1 (e.g. 2) let rare, high-value tokens dominate more heavily over several common-word matches — prototype fix for cases where a document missing the single most diagnostic word still outscores one that has it (diagnosed 2026-08-11 against anatomy_06/guideline_01/guideline_10). Also proportionally affects overlap_pct and the threshold cutoff, since both derive from the same per-token weight. NOT yet validated against a broad regression set — compare results at weight_power:1 vs weight_power:2+ before trusting a change in ranking.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0 }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0, weight_power = 1 }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
       // truncate:false — pull the FULL above-threshold pool, not just the first
@@ -405,7 +406,8 @@ server.tool(
         fpd,
         maxResults: max_results,
         parallel,
-        truncate: false
+        truncate: false,
+        weightPower: weight_power
       });
 
       const { results: rerankedFull, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
