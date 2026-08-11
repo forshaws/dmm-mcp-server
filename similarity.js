@@ -33,6 +33,38 @@
 //   order — output (scores, ranking, diagnostics) is identical to the
 //   sequential path either way; only the number of concurrent HTTP calls
 //   to the DMM appliance changes. No change to the scoring algorithm.
+//
+// v1.7.0 — Optional weightPower exponent (opt-in, default unchanged)
+//   Root cause diagnosed 2026-08-11 against three real benchmark failures
+//   (anatomy_06, guideline_01, guideline_10 — Radiology Academy 130-query
+//   set): tokenWeight()'s log-dampening is deliberately narrow (a rare
+//   token like "bronchopulmonary", docCount 1566, only gets weight ~0.094
+//   vs ~0.055-0.068 for generic query words like "chest"/"CT"/"anatomy" —
+//   under 2x spread). Since scores are a plain SUM of matched weights, a
+//   document matching 6 generic words can and does outscore a document
+//   matching 5 words including the one rare, actually-diagnostic term —
+//   confirmed live: anatomy_06's wrong top-1 (missing "bronchopulmonary")
+//   scored 0.381; the real bronchopulmonary-containing document scored
+//   0.357, only 0.024 behind, sitting at rank 3 of 50 rather than 1.
+//
+//   New optional `weightPower` (default 1 = exact pre-v1.7.0 behaviour,
+//   byte-identical output) raises each token's log-dampened weight to
+//   this power BEFORE summing, so rarer tokens dominate more heavily
+//   relative to common ones. Applied inside tokenWeight() itself, so
+//   totalWeight/threshold/overlap_pct — which all derive from the same
+//   per-token weight value — stay internally consistent automatically;
+//   no other code path needed changing. Verified against real
+//   anatomy_06 data: weightPower=2 flips the two documents above
+//   (0.0244 vs 0.0264, real bronchopulmonary-containing doc wins) using
+//   the corpus's own real per-token weights, not simulated data.
+//
+//   NOT yet validated against the known-good query set (physics_03,
+//   dose_03, dose_06, diagnostic_01, protocol_10) or the other two
+//   bag-of-tokens failures (guideline_01, guideline_10) — that
+//   regression pass is the reason this ships opt-in (default 1, old
+//   ranking unchanged) rather than replacing the default outright.
+//   Intended workflow: run the benchmark twice, once at the default and
+//   once with weightPower passed through, and diff.
 
 const crypto = require('crypto');
 const { tokenise } = require('./tokeniser');
@@ -158,11 +190,24 @@ function stripTimestamp(ref) {
  * docCount=10 → weight = 1 / log2(12) ≈ 0.279
  * docCount=900→ weight = 1 / log2(902)≈ 0.103
  *
+ * v1.7.0 — optional `power` exponent, default 1 (exact prior behaviour,
+ * unchanged). Raising the log-dampened weight to a power >1 before it
+ * gets summed with other tokens' weights makes rare/high-value tokens
+ * dominate more over several common-word matches — see the v1.7.0 header
+ * note above for the real anatomy_06 case this targets. docCount=0's
+ * weight of exactly 1 is unaffected by any power (1^n = 1), so the
+ * "effectively required" threshold behaviour for a totally-absent token
+ * is preserved at every power value.
+ *
  * @param {number} docCount - Number of documents this token matched
+ * @param {number} [power=1] - Exponent applied to the log-dampened weight
+ *   before it is used. 1 = unchanged pre-v1.7.0 behaviour. >1 sharpens
+ *   the gap between rare and common tokens.
  * @returns {number} weight, always > 0
  */
-function tokenWeight(docCount) {
-  return 1 / Math.log2(Math.max(docCount, 0) + 2);
+function tokenWeight(docCount, power = 1) {
+  const base = 1 / Math.log2(Math.max(docCount, 0) + 2);
+  return power === 1 ? base : Math.pow(base, power);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +333,15 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
  *   (up to tokens.length concurrent HTTP calls) — worth a quick check that the target
  *   appliance handles concurrent searchDoc requests cleanly before relying on this in
  *   production, especially on constrained hardware (e.g. the Pi5).
+ * @param {number} [options.weightPower=1] - Exponent applied to each token's
+ *   log-dampened IDF weight (see tokenWeight()) before it is summed into a
+ *   document's score. 1 = exact pre-v1.7.0 behaviour, byte-identical output.
+ *   Values >1 (e.g. 2) let rare/high-value tokens dominate more heavily over
+ *   several common-word matches — opt-in prototype for the bag-of-tokens
+ *   ranking failures diagnosed 2026-08-11 (anatomy_06/guideline_01/
+ *   guideline_10). Also affects totalWeight and therefore overlap_pct and
+ *   the threshold cutoff, consistently — all three derive from the same
+ *   per-token weight value, so nothing needed separate handling.
  * @param {boolean} [options.truncate=true] - Slice the above-threshold, sorted match
  *   set down to `maxResults` before returning. Default true preserves existing
  *   behaviour for tqnn_similarity/tqnn_similarity_plain exactly. Callers that need to
@@ -309,7 +363,8 @@ async function similaritySearch(client, text, {
   weighted = true,
   pqr = true,
   parallel = false,
-  truncate = true
+  truncate = true,
+  weightPower = 1
 } = {}) {
   const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
@@ -323,6 +378,7 @@ async function similaritySearch(client, text, {
       pqr,
       fpd: effectiveFpd,
       parallel,
+      weight_power: weightPower,
       results: [],
       timing: {
         wall_clock_ms: 0,
@@ -385,7 +441,7 @@ async function similaritySearch(client, text, {
     });
 
     const docCount = refs.length;
-    const weight = weighted ? tokenWeight(docCount) : 1;
+    const weight = weighted ? tokenWeight(docCount, weightPower) : 1;
     totalWeight += weight;
     tokenInfo.push({ token, docCount, weight: Math.round(weight * 1000) / 1000 });
 
@@ -458,6 +514,7 @@ async function similaritySearch(client, text, {
     pqr,
     fpd: effectiveFpd,
     parallel,
+    weight_power: weightPower, // 1 = pre-v1.7.0 behaviour; see tokenWeight() header note
     token_weights: tokenInfo, // per-token doc frequency + weight, for auditability
     timing: {
       wall_clock_ms: wallClockMs,
