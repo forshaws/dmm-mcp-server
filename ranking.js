@@ -28,6 +28,27 @@
 // tqnn_similarity_ranked tool, after similaritySearch() has already run
 // and returned its (possibly tied) results.
 //
+// V1.6.1 — Fixed a stack overflow on very high-frequency single-token
+//   queries. applyCitationShapeRanking() previously used
+//   `reranked.push(...distinct, ...duplicates, ...withoutScore)` —
+//   spreading array elements into a function call, which V8 caps by
+//   argument count (independent of normal array-size limits). A
+//   single-token query on a common word (e.g. "imaging", 514,399 matches
+//   in the Radiology dataset) makes every matching chunk tie on
+//   weighted_score (there is only one token's weight to sum), so the
+//   entire result set becomes ONE tie group — and spreading a 514k-element
+//   array into push() blew the argument-count ceiling with "Maximum call
+//   stack size exceeded". Confirmed via live 500/crash on the appliance,
+//   then reproduced exactly (byte-identical error message) at N=514,399 in
+//   isolation. Fixed by replacing the three spread-pushes with plain
+//   loops, which have no such limit at any array size. Multi-token queries
+//   were never affected — tie groups there are naturally bounded by how
+//   many chunks can share one exact combined score across several tokens,
+//   which stays far below V8's argument-count ceiling in practice.
+//   applySourceCap()'s `[...kept, ...deferred]` (array-LITERAL spread, a
+//   different and safe construct — no argument-count limit applies)
+//   confirmed unaffected and left as-is.
+//
 // Ranking data is precomputed OFFLINE per dataset by
 // build_shard_ranking_metadata.py, run once against a dataset's corpus
 // shards. Output is a flat, pipe-delimited file:
@@ -270,7 +291,20 @@ function applyCitationShapeRanking(results, dataset) {
         }
       }
 
-      reranked.push(...distinct, ...duplicates, ...withoutScore);
+      // Append distinct/duplicate/no-data results to the running output.
+      // NOTE (V1.6.1): previously `reranked.push(...distinct, ...duplicates,
+      // ...withoutScore)`. That spreads every element as an individual
+      // argument to push() — fine for a normal tie group, but for a
+      // single-token query on a very high-frequency word (e.g. "imaging",
+      // 514k+ matches — every matching chunk ties on weighted_score since
+      // there's only one token's weight to sum, so the ENTIRE result set
+      // becomes one tie group), that blows V8's function-call argument
+      // limit with "Maximum call stack size exceeded". A plain loop has no
+      // such limit — it's identical at any size, normal or huge, so there's
+      // no reason to keep the spread form even for the common case.
+      for (const r of distinct) reranked.push(r);
+      for (const r of duplicates) reranked.push(r);
+      for (const r of withoutScore) reranked.push(r);
     } else {
       reranked.push({ ...tieGroup[0], duplicate_of: null });
     }
