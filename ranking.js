@@ -403,6 +403,52 @@ function applySourceCap(results, maxPerSource = 0) {
   return [...kept, ...deferred];
 }
 
+/**
+ * Push every result where is_figure===true behind every result where it
+ * isn't, preserving relative order within each group. Same non-destructive
+ * shape as applySourceCap() above: nothing removed, nothing re-scored —
+ * just a partition, tagged for auditability (`figure_demoted`) so a caller
+ * with a large enough max_results still sees figure chunks, and the effect
+ * is visible rather than silent.
+ *
+ * Deliberately a hard partition rather than a scoring adjustment folded
+ * into citationShapeScore: citation_shape's dd/cwr/pd were built to detect
+ * bibliography shape, not figure-caption shape, and only ever reorders
+ * WITHIN an exact weighted_score tie — a figure chunk that happens to pack
+ * in several exact query tokens densely could otherwise outright outscore
+ * a real prose chunk, which citation-shape reranking would never touch.
+ * This runs across the whole list regardless of ties, same as
+ * applySourceCap does for source concentration.
+ *
+ * Results with is_figure null/undefined (no ranking data for that chunk,
+ * or an older .rank file without the 7th field) are treated as "not a
+ * figure" — never demoted — since there's no basis to demote without a
+ * positive is_figure:true.
+ *
+ * @param {object[]} results - Output of applyCitationShapeRanking's `results`
+ *   (each entry already carries `is_figure`, or null if unavailable)
+ * @param {boolean} [demoteFigures=false] - false (default) = returns results
+ *   unchanged (with figure_demoted:false tagged on every entry for a
+ *   consistent shape) — existing callers see no behaviour change.
+ * @returns {object[]}
+ */
+function applyFigureDemotion(results, demoteFigures = false) {
+  if (!demoteFigures) {
+    return results.map(r => ({ ...r, figure_demoted: false }));
+  }
+
+  const kept = [];
+  const deferred = [];
+  for (const r of results) {
+    if (r.is_figure === true) {
+      deferred.push({ ...r, figure_demoted: true });
+    } else {
+      kept.push({ ...r, figure_demoted: false });
+    }
+  }
+  return [...kept, ...deferred];
+}
+
 module.exports = {
   loadRankingTable,
   filereferenceToChunkId,
@@ -410,6 +456,7 @@ module.exports = {
   exactDuplicateKey,
   applyCitationShapeRanking,
   applySourceCap,
+  applyFigureDemotion,
   isSafeDatasetName,
   RANKING_DIR
 };

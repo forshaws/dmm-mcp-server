@@ -49,7 +49,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
 const { similaritySearch, pqrHash, pqrHashReversed, tokenise, stripTimestamp } = require('./similarity');
-const { applyCitationShapeRanking, applySourceCap } = require('./ranking');
+const { applyCitationShapeRanking, applySourceCap, applyFigureDemotion } = require('./ranking');
 const { OAuthServer, readBody } = require('./oauth');
 const { resolverDispatch, registerMemory } = require('./resolver');
 const fs   = require('fs');
@@ -388,9 +388,10 @@ server.tool(
     max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
     parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way (citation-shape reranking is unaffected) — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.'),
     max_per_source: z.number().int().min(0).max(100).default(0).optional().describe('Cap on how many results may come from any single source document (grouped by source_id in the ranking data). 0 (default) = uncapped, identical behaviour to not passing this parameter at all. When >0, results from a source beyond the cap are pushed behind other results (never dropped) and tagged source_capped:true — a large enough max_results will still surface them. Requires ranking data (same offline build as citation-shape reranking); has no effect when ranking_available is false.'),
-    weight_power: z.number().min(1).max(4).default(1).optional().describe('EXPERIMENTAL, opt-in. Exponent applied to each token\'s log-dampened IDF weight before summing into weighted_score. Default 1 = current/original behaviour, byte-identical output. Values >1 (e.g. 2) let rare, high-value tokens dominate more heavily over several common-word matches — prototype fix for cases where a document missing the single most diagnostic word still outscores one that has it (diagnosed 2026-08-11 against anatomy_06/guideline_01/guideline_10). Also proportionally affects overlap_pct and the threshold cutoff, since both derive from the same per-token weight. NOT yet validated against a broad regression set — compare results at weight_power:1 vs weight_power:2+ before trusting a change in ranking.')
+    weight_power: z.number().min(1).max(4).default(1).optional().describe('EXPERIMENTAL, opt-in. Exponent applied to each token\'s log-dampened IDF weight before summing into weighted_score. Default 1 = current/original behaviour, byte-identical output. Values >1 (e.g. 2) let rare, high-value tokens dominate more heavily over several common-word matches — prototype fix for cases where a document missing the single most diagnostic word still outscores one that has it (diagnosed 2026-08-11 against anatomy_06/guideline_01/guideline_10). Also proportionally affects overlap_pct and the threshold cutoff, since both derive from the same per-token weight. NOT yet validated against a broad regression set — compare results at weight_power:1 vs weight_power:2+ before trusting a change in ranking.'),
+    demote_figures: z.boolean().default(false).optional().describe('False (default) = current/original behaviour, byte-identical output. When true, results whose ranking data flags is_figure:true (a chunk extracted separately from a figure caption by an older ingest pass — confirmed 2026-08-13 to be consistently low-value: truncated captions, garbled OCR fragments, or no real caption at all) are pushed behind every non-figure result, regardless of weighted_score — a figure chunk is never dropped, just never allowed to outrank real content. Requires ranking data built with is_figure support (build_shard_ranking_metadata.py 2026-08-13+); has no effect on older .rank files, where is_figure is simply unavailable for every row.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0, weight_power = 1 }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0, weight_power = 1, demote_figures = false }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
       // truncate:false — pull the FULL above-threshold pool, not just the first
@@ -424,16 +425,27 @@ server.tool(
         : rerankedFull.filter(r => r.weighted_score === topScore).length;
       const fullyRanked = topScoreTiedCount <= max_results;
 
-      // Source cap runs AFTER citation-shape reranking, across the whole
-      // pool (not scoped to individual tie groups — see applySourceCap's
-      // own doc comment for why). max_per_source:0 (default) is a no-op
-      // that just tags every result source_capped:false, so this is safe
-      // to call unconditionally.
-      const sourceCappedFull = applySourceCap(rerankedFull, max_per_source);
+      // Figure demotion runs AFTER citation-shape reranking (so prose-vs-
+      // bibliography tie-breaking still happens first, unchanged) and
+      // BEFORE source capping — a paper's figure chunks now share the same
+      // source_id as its real chunks (fixed 2026-08-13), so running source
+      // cap on the figure-demoted order lets it cap concentration within
+      // each group sensibly rather than being skewed by figures still
+      // sitting ahead of real content. demote_figures:false (default) is a
+      // no-op that just tags every result figure_demoted:false, so this is
+      // safe to call unconditionally.
+      const figureDemotedFull = applyFigureDemotion(rerankedFull, demote_figures);
 
-      // Truncate AFTER both reranking passes, so max_results reflects the
-      // true top-N by citation-shape order AND source-cap order, rather
-      // than an arbitrary pre-ranking slice.
+      // Source cap runs AFTER citation-shape reranking AND figure demotion,
+      // across the whole pool (not scoped to individual tie groups — see
+      // applySourceCap's own doc comment for why). max_per_source:0
+      // (default) is a no-op that just tags every result
+      // source_capped:false, so this is safe to call unconditionally.
+      const sourceCappedFull = applySourceCap(figureDemotedFull, max_per_source);
+
+      // Truncate AFTER all three reranking passes, so max_results reflects
+      // the true top-N by citation-shape, figure-demotion, AND source-cap
+      // order, rather than an arbitrary pre-ranking slice.
       const rerankedResults = sourceCappedFull.slice(0, max_results);
 
       return {
@@ -446,7 +458,8 @@ server.tool(
             top_score_tied_count: topScoreTiedCount,
             fully_ranked: fullyRanked,
             ranking_available,
-            max_per_source: max_per_source || null
+            max_per_source: max_per_source || null,
+            demote_figures
           }, null, 2)
         }]
       };
