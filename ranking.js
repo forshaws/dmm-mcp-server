@@ -52,13 +52,35 @@
 // Ranking data is precomputed OFFLINE per dataset by
 // build_shard_ranking_metadata.py, run once against a dataset's corpus
 // shards. Output is a flat, pipe-delimited file:
-//     chunk_id|dd|cwr|pd|ent|source_id
+//     chunk_id|dd|cwr|pd|ent|source_id|is_figure
 // (source_id added — see applySourceCap() below — a short hash of the
-// chunk's source document title, used to cap how many chunks from one
-// document can occupy a result set. Older .rank files without a 6th
-// field still parse fine; source_id is simply undefined for those rows,
-// and applySourceCap() treats any result with no source_id as ungroupable
+// chunk's source document, used to cap how many chunks from one document
+// can occupy a result set. Older .rank files without a 6th field still
+// parse fine; source_id is simply undefined for those rows, and
+// applySourceCap() treats any result with no source_id as ungroupable
 // and passes it through uncapped.)
+//
+// V2 (2026-08-13) — is_figure added as an optional 7th field: "1" if this
+// chunk's title matched the "Figure N - ..." pattern at build time (see
+// build_shard_ranking_metadata.py's own V2 notes), "0" otherwise.
+// Confirmed live against 5 real chunks across 2 independent papers: every
+// Figure-titled chunk found was low-value (truncated caption, garbled
+// OCR fragment, or no caption at all) versus the same paper's other
+// chunks. Same file also fixed a real source_id bug found the same day —
+// source_id used to hash the raw per-chunk title, but title varies
+// chunk-to-chunk (every figure chunk has its own distinct truncated
+// title), so a paper's figure chunks previously got a DIFFERENT
+// source_id from its own real chunks — meaning applySourceCap() could
+// not recognize them as the same source it was already correctly capping
+// everything else from. Older 5/6-field .rank files still parse fine;
+// is_figure simply comes back undefined for those rows. Attached to
+// every result for auditability the same way citation_shape/source_id
+// already are — NOT yet consumed by any reordering/demotion logic here.
+// Whether and how to act on is_figure (tie-scoped score adjustment like
+// citation_shape, or a whole-list pass like applySourceCap, or something
+// else) is a separate, not-yet-decided design question — see
+// dmm-round2-tuning notes, 2026-08-13.
+//
 // stored per-dataset (this deployment model is one MCP server instance
 // per user/dataset, so there is normally at most one ranking file
 // relevant to a given running server — but the loader is dataset-keyed
@@ -91,26 +113,28 @@ function isSafeDatasetName(dataset) {
 }
 
 /**
- * Parse one line of a .rank file into a metadata object. Accepts both the
- * original 5-field format (chunk_id|dd|cwr|pd|ent) and the newer 6-field
- * format with source_id appended, so a server can be pointed at an older
- * .rank file without regenerating it — source_id simply comes back
- * undefined in that case, and applySourceCap() treats that as "can't
- * group this one" rather than erroring.
- * @param {string} line - "chunk_id|dd|cwr|pd|ent" or "chunk_id|dd|cwr|pd|ent|source_id"
- * @returns {{chunk_id: string, dd: number, cwr: number, pd: number, ent: number, source_id: string|undefined} | null}
+ * Parse one line of a .rank file into a metadata object. Accepts the
+ * original 5-field format (chunk_id|dd|cwr|pd|ent), the 6-field format
+ * with source_id appended, and the newer 7-field format with is_figure
+ * also appended — so a server can be pointed at an older .rank file
+ * without regenerating it, and any field added after this file's own
+ * data doesn't exist for those rows simply comes back undefined rather
+ * than erroring.
+ * @param {string} line - "chunk_id|dd|cwr|pd|ent", "...|source_id", or "...|source_id|is_figure"
+ * @returns {{chunk_id: string, dd: number, cwr: number, pd: number, ent: number, source_id: string|undefined, is_figure: boolean|undefined} | null}
  */
 function parseRankLine(line) {
   const parts = line.split('|');
-  if (parts.length !== 5 && parts.length !== 6) return null;
-  const [chunk_id, dd, cwr, pd, ent, source_id] = parts;
+  if (parts.length < 5 || parts.length > 7) return null;
+  const [chunk_id, dd, cwr, pd, ent, source_id, is_figure] = parts;
   return {
     chunk_id,
     dd: parseFloat(dd),
     cwr: parseFloat(cwr),
     pd: parseFloat(pd),
     ent: parseFloat(ent),
-    source_id: source_id || undefined
+    source_id: source_id || undefined,
+    is_figure: is_figure === undefined ? undefined : is_figure === '1'
   };
 }
 
@@ -121,7 +145,7 @@ function parseRankLine(line) {
  * Cache is invalidated on file mtime change, matching the pattern already
  * used for tqnn_mcp_credentials.json in index.js.
  * @param {string} dataset
- * @returns {Map<string, {dd:number,cwr:number,pd:number,ent:number}> | null}
+ * @returns {Map<string, {dd:number,cwr:number,pd:number,ent:number,source_id:string|undefined,is_figure:boolean|undefined}> | null}
  */
 function loadRankingTable(dataset) {
   if (!dataset || !isSafeDatasetName(dataset)) return null;
@@ -235,7 +259,7 @@ function applyCitationShapeRanking(results, dataset) {
     const chunkId = filereferenceToChunkId(r.filereference);
     const entry = ranking_available ? table.get(chunkId) : undefined;
     if (!entry) {
-      return { ...r, citation_shape: null, source_id: null };
+      return { ...r, citation_shape: null, source_id: null, is_figure: null };
     }
     return {
       ...r,
@@ -246,7 +270,11 @@ function applyCitationShapeRanking(results, dataset) {
         ent: entry.ent,
         score: Math.round(citationShapeScore(entry) * 1000) / 1000
       },
-      source_id: entry.source_id || null
+      source_id: entry.source_id || null,
+      // Surfaced for auditability, same as citation_shape/source_id above —
+      // NOT currently consumed by the reordering below. Whether/how to act
+      // on it is a separate, not-yet-decided design question.
+      is_figure: entry.is_figure === undefined ? null : entry.is_figure
     };
   });
 
