@@ -449,6 +449,249 @@ function applyFigureDemotion(results, demoteFigures = false) {
   return [...kept, ...deferred];
 }
 
+// ---------------------------------------------------------------------------
+// Aboutness — paper-level topic-overlap soft demotion (added 2026-08-14)
+// ---------------------------------------------------------------------------
+//
+// Built from a completely separate offline index (build_aboutness_index.py
+// — see that script's header for the full design rationale) that groups
+// non-figure chunks by source_id (the SAME source_id already used by
+// applySourceCap/applyFigureDemotion above — deliberately read from the
+// same loadRankingTable() rather than recomputed, so the join always
+// lines up) and concatenates each paper's per-chunk AI-generated preamble
+// sentences into one token set per paper.
+//
+// Multiplicative-only demotion, never a boost: a paper whose preamble
+// tokens overlap heavily with the query's tokens keeps its weighted_score
+// essentially unchanged (factor -> 1.0); a paper with little/no overlap
+// gets scaled down toward `floor`, never below it, and NEVER excluded —
+// same non-destructive philosophy as figure-demotion/source-capping.
+// Deliberately NOT additive (unlike weight_power, which can amplify a
+// document upward and — per the 2026-08-11 testing — fixed anatomy_06
+// while regressing dose_06 and worsening guideline_10 in the same
+// change). A pure demotion factor can only ever make a wrong-topic paper
+// LESS competitive, never make any paper MORE competitive than its own
+// honest weighted_score — bounded, one-directional risk.
+//
+// Runs BEFORE applyCitationShapeRanking (establishes the primary sort
+// order; citation-shape then still tie-breaks WITHIN whatever comes out
+// tied on weighted_score, which is left untouched — only a separate
+// adjusted score is used for the aboutness sort itself, for auditability).
+
+const ABOUTNESS_DIR = process.env.TQNN_ABOUTNESS_DIR || '/home/tqnn/data/aboutness';
+
+// dataset -> { mtimeMs, ids: string[], offsets: number[], lengths: number[], fd: number }
+const _aboutnessIndexCache = new Map();
+
+/**
+ * Loads (and caches) the small sorted byte-offset index for a dataset's
+ * aboutness data — NOT the token data itself, which stays on disk and is
+ * only ever read one paper at a time via getPaperAboutnessTokens(). This
+ * keeps memory bounded by (unique papers x ~20 bytes/index-row), not by
+ * corpus size or total token volume — the same reason build_chunk_index.py
+ * /chunk-index.js use a byte-offset index rather than loading everything.
+ * Returns null — never throws — if no aboutness index exists for this
+ * dataset, so callers degrade gracefully to "aboutness not available".
+ * @param {string} dataset
+ * @returns {{ids: string[], offsets: number[], lengths: number[], fd: number} | null}
+ */
+function loadAboutnessIndex(dataset) {
+  if (!dataset || !isSafeDatasetName(dataset)) return null;
+
+  const indexPath = path.join(ABOUTNESS_DIR, `aboutness_${dataset}_index.tsv`);
+  const tokensPath = path.join(ABOUTNESS_DIR, `aboutness_${dataset}.jsonl`);
+  let stat;
+  try {
+    stat = fs.statSync(indexPath);
+  } catch {
+    return null; // no aboutness index built for this dataset yet — expected/common case
+  }
+
+  const cached = _aboutnessIndexCache.get(dataset);
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    return cached;
+  }
+
+  // Close a stale fd from a previous (now outdated) load before opening a new one.
+  if (cached && typeof cached.fd === 'number') {
+    try { fs.closeSync(cached.fd); } catch { /* already closed / never opened — fine */ }
+  }
+
+  const ids = [];
+  const offsets = [];
+  const lengths = [];
+  const raw = fs.readFileSync(indexPath, 'utf8');
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [id, off, len] = trimmed.split('\t');
+    if (id === undefined || off === undefined || len === undefined) continue;
+    ids.push(id);
+    offsets.push(parseInt(off, 10));
+    lengths.push(parseInt(len, 10));
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(tokensPath, 'r');
+  } catch {
+    return null; // index exists but the token data file doesn't/can't be opened — treat as unavailable
+  }
+
+  const entry = { mtimeMs: stat.mtimeMs, ids, offsets, lengths, fd };
+  _aboutnessIndexCache.set(dataset, entry);
+  return entry;
+}
+
+/**
+ * Binary-search `ids` (sorted, LC_ALL=C / plain-string order — matches
+ * build_aboutness_index.py's sort) for an exact match. Returns the index
+ * into the parallel offsets/lengths arrays, or -1 if not found.
+ * @param {string[]} ids
+ * @param {string} target
+ * @returns {number}
+ */
+function bisectExact(ids, target) {
+  let lo = 0, hi = ids.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ids[mid] === target) return mid;
+    if (ids[mid] < target) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+/**
+ * Fetches one paper's preamble token set by source_id, seeking directly
+ * to its byte range in the aboutness_<dataset>.jsonl file rather than
+ * scanning — same O(log n) lookup + O(1) seek pattern as chunk-index.js.
+ * Tokens are returned lowercased (aboutness is a soft topical signal, not
+ * exact PQR-hash matching, so a case-insensitive comparison here is
+ * intentional and does not need the case_insensitive merge machinery
+ * similaritySearch() uses for real token search).
+ *
+ * Deliberately NOT cached across calls beyond the single fs.readSync —
+ * only the small byte-offset index is cached (see loadAboutnessIndex);
+ * re-reading one JSONL line per lookup is cheap (OS page cache absorbs
+ * repeat reads within a session) and avoids an unbounded per-paper token
+ * cache growing indefinitely on a long-running MCP server process.
+ * @param {string} dataset
+ * @param {string} sourceId
+ * @returns {Set<string> | null}
+ */
+function getPaperAboutnessTokens(dataset, sourceId) {
+  const index = loadAboutnessIndex(dataset);
+  if (!index || !sourceId) return null;
+
+  const i = bisectExact(index.ids, sourceId);
+  if (i === -1) return null;
+
+  const buf = Buffer.alloc(index.lengths[i]);
+  try {
+    fs.readSync(index.fd, buf, 0, index.lengths[i], index.offsets[i]);
+  } catch {
+    return null;
+  }
+
+  try {
+    const record = JSON.parse(buf.toString('utf8'));
+    return new Set((record.tokens || []).map(t => t.toLowerCase()));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Re-orders a tqnn_similarity result set using paper-level aboutness —
+ * WITHOUT changing which documents are included (threshold membership
+ * was already decided in similaritySearch()) and WITHOUT modifying each
+ * result's own weighted_score (left exactly as computed, so it remains a
+ * pure, auditable reflection of raw token overlap — a separate
+ * aboutness_factor/aboutness_matched_weight is attached instead, and only
+ * an internal adjusted score derived from the two is used for sorting).
+ *
+ * @param {object[]} results - similaritySearch()'s raw `results` array
+ *   (call this BEFORE applyCitationShapeRanking — see module header)
+ * @param {string} dataset
+ * @param {Array<{token:string, docCount:number, weight:number}>} tokenWeights
+ *   - similaritySearch()'s own token_weights output. A merged
+ *   case-insensitive group's `token` field (e.g. "imaging/Imaging") is
+ *   split on '/' and only the first form's lowercase is used as the
+ *   concept key — the weight already reflects the merged docCount, so no
+ *   double-counting.
+ * @param {number} [floor=0.5] - Minimum demotion factor (0-1). A paper
+ *   with ZERO query-token overlap in its preamble is scaled to exactly
+ *   this fraction of its original weighted_score, never lower, never
+ *   excluded. 1.0 would make this a no-op; 0 would allow a full
+ *   hard-exclude-equivalent demotion, deliberately not the default given
+ *   the explicit soft-demote design decision (see build_aboutness_index.py
+ *   header and the guideline_10 raw-candidate check that motivated it).
+ * @returns {{ results: object[], aboutness_available: boolean }}
+ */
+function applyAboutnessReorder(results, dataset, tokenWeights, floor = 0.5) {
+  const aboutnessIndex = loadAboutnessIndex(dataset);
+  if (!aboutnessIndex) {
+    return {
+      results: results.map(r => ({ ...r, aboutness_factor: null, aboutness_matched_weight: null })),
+      aboutness_available: false
+    };
+  }
+
+  const rankTable = loadRankingTable(dataset); // for source_id lookup only — same cached table citation-shape uses
+
+  const conceptWeights = new Map(); // lowercase concept -> weight
+  let totalConceptWeight = 0;
+  for (const tw of tokenWeights || []) {
+    const key = tw.token.split('/')[0].toLowerCase();
+    if (!conceptWeights.has(key)) {
+      conceptWeights.set(key, tw.weight);
+      totalConceptWeight += tw.weight;
+    }
+  }
+
+  const augmented = results.map(r => {
+    const chunkId = filereferenceToChunkId(r.filereference);
+    const rankEntry = rankTable ? rankTable.get(chunkId) : undefined;
+    const sourceId = rankEntry && rankEntry.source_id;
+    if (!sourceId) {
+      return { ...r, aboutness_factor: null, aboutness_matched_weight: null, _adjusted_score: r.weighted_score };
+    }
+
+    const paperTokens = getPaperAboutnessTokens(dataset, sourceId);
+    if (!paperTokens) {
+      return { ...r, aboutness_factor: null, aboutness_matched_weight: null, _adjusted_score: r.weighted_score };
+    }
+
+    let matchedWeight = 0;
+    for (const [concept, weight] of conceptWeights) {
+      if (paperTokens.has(concept)) matchedWeight += weight;
+    }
+    const ratio = totalConceptWeight > 0 ? matchedWeight / totalConceptWeight : 0;
+    const factor = floor + (1 - floor) * ratio;
+
+    return {
+      ...r,
+      aboutness_factor: Math.round(factor * 1000) / 1000,
+      aboutness_matched_weight: Math.round(matchedWeight * 1000) / 1000,
+      _adjusted_score: r.weighted_score * factor
+    };
+  });
+
+  // Stable sort by adjusted score descending. weighted_score itself is
+  // untouched on every result — applyCitationShapeRanking's tie-detection
+  // (which groups by exact weighted_score equality) still works correctly
+  // on whatever order it receives next.
+  augmented.sort((a, b) => b._adjusted_score - a._adjusted_score);
+
+  const cleaned = augmented.map(r => {
+    const { _adjusted_score, ...rest } = r;
+    return rest;
+  });
+
+  return { results: cleaned, aboutness_available: true };
+}
+
 module.exports = {
   loadRankingTable,
   filereferenceToChunkId,
@@ -457,6 +700,10 @@ module.exports = {
   applyCitationShapeRanking,
   applySourceCap,
   applyFigureDemotion,
+  applyAboutnessReorder,
+  loadAboutnessIndex,
+  getPaperAboutnessTokens,
   isSafeDatasetName,
-  RANKING_DIR
+  RANKING_DIR,
+  ABOUTNESS_DIR
 };

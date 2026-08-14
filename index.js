@@ -49,7 +49,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { TQNNClient } = require('./tqnn-client');
 const { similaritySearch, pqrHash, pqrHashReversed, tokenise, stripTimestamp } = require('./similarity');
-const { applyCitationShapeRanking, applySourceCap, applyFigureDemotion } = require('./ranking');
+const { applyCitationShapeRanking, applySourceCap, applyFigureDemotion, applyAboutnessReorder } = require('./ranking');
 const { OAuthServer, readBody } = require('./oauth');
 const { resolverDispatch, registerMemory } = require('./resolver');
 const fs   = require('fs');
@@ -390,9 +390,10 @@ server.tool(
     max_per_source: z.number().int().min(0).max(100).default(0).optional().describe('Cap on how many results may come from any single source document (grouped by source_id in the ranking data). 0 (default) = uncapped, identical behaviour to not passing this parameter at all. When >0, results from a source beyond the cap are pushed behind other results (never dropped) and tagged source_capped:true — a large enough max_results will still surface them. Requires ranking data (same offline build as citation-shape reranking); has no effect when ranking_available is false.'),
     weight_power: z.number().min(1).max(4).default(1).optional().describe('EXPERIMENTAL, opt-in. Exponent applied to each token\'s log-dampened IDF weight before summing into weighted_score. Default 1 = current/original behaviour, byte-identical output. Values >1 (e.g. 2) let rare, high-value tokens dominate more heavily over several common-word matches — prototype fix for cases where a document missing the single most diagnostic word still outscores one that has it (diagnosed 2026-08-11 against anatomy_06/guideline_01/guideline_10). Also proportionally affects overlap_pct and the threshold cutoff, since both derive from the same per-token weight. NOT yet validated against a broad regression set — compare results at weight_power:1 vs weight_power:2+ before trusting a change in ranking.'),
     demote_figures: z.boolean().default(false).optional().describe('False (default) = current/original behaviour, byte-identical output. When true, results whose ranking data flags is_figure:true (a chunk extracted separately from a figure caption by an older ingest pass — confirmed 2026-08-13 to be consistently low-value: truncated captions, garbled OCR fragments, or no real caption at all) are pushed behind every non-figure result, regardless of weighted_score — a figure chunk is never dropped, just never allowed to outrank real content. Requires ranking data built with is_figure support (build_shard_ranking_metadata.py 2026-08-13+); has no effect on older .rank files, where is_figure is simply unavailable for every row.'),
-    case_insensitive: z.boolean().default(false).optional().describe('False (default) = current/original behaviour, byte-identical output — every searched token (including deliberately-sent case variants, e.g. a client sending both "imaging" and "Imaging" since PQR hashing is case-sensitive per casing) is scored as its own fully independent requirement. When true, tokens differing only by case are grouped by lowercase form and MERGED into one requirement before scoring: each variant is still individually searched against DMM (no change to what gets searched), but their matched-document sets are unioned and ONE weight is computed from the union — a document matching either casing (or both) is credited once, never double-counted, and never required to match every casing to get full credit. Fixes the specific regression diagnosed 2026-08-14 where sending un-merged case duplicates caused documents that previously matched cleanly to drop below threshold (denominator inflated by tokens the winning document never actually needed) — including a docCount:0 duplicate (a casing that exists nowhere in the corpus) permanently poisoning the threshold with an unmatchable max-weight token. Has no effect on tokens with no case-variant partner in the query.')
+    case_insensitive: z.boolean().default(false).optional().describe('False (default) = current/original behaviour, byte-identical output — every searched token (including deliberately-sent case variants, e.g. a client sending both "imaging" and "Imaging" since PQR hashing is case-sensitive per casing) is scored as its own fully independent requirement. When true, tokens differing only by case are grouped by lowercase form and MERGED into one requirement before scoring: each variant is still individually searched against DMM (no change to what gets searched), but their matched-document sets are unioned and ONE weight is computed from the union — a document matching either casing (or both) is credited once, never double-counted, and never required to match every casing to get full credit. Fixes the specific regression diagnosed 2026-08-14 where sending un-merged case duplicates caused documents that previously matched cleanly to drop below threshold (denominator inflated by tokens the winning document never actually needed) — including a docCount:0 duplicate (a casing that exists nowhere in the corpus) permanently poisoning the threshold with an unmatchable max-weight token. Has no effect on tokens with no case-variant partner in the query.'),
+    aboutness: z.boolean().default(false).optional().describe("False (default) = current/original behaviour, byte-identical output. When true, results are re-scored (for ORDERING only — never for threshold inclusion, which was already decided before this runs) using a paper-level topic-overlap check: each candidate's source paper has a precomputed set of preamble tokens (see build_aboutness_index.py), and a paper whose preamble shares little/none of the query's tokens gets its weighted_score scaled down toward a floor (default 0.5) for sorting purposes only — weighted_score itself is left untouched on every result, an aboutness_factor/aboutness_matched_weight is attached instead. Multiplicative demotion only, never a boost — bounded, one-directional risk, unlike weight_power. Targets the specific failure mode diagnosed 2026-08-14 where a document from a genuinely different-topic paper (e.g. a Solitary Fibrous Tumor case report) outranked the correct paper on generic word overlap alone (e.g. an RCC-staging query). Requires an aboutness index built for the target dataset (see TQNN_ABOUTNESS_DIR); has no effect and reports aboutness_available:false if none exists.")
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0, weight_power = 1, demote_figures = false, case_insensitive = false }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false, max_per_source = 0, weight_power = 1, demote_figures = false, case_insensitive = false, aboutness = false }) => {
     try {
       const targetDataset = dataset || CONFIG.dataset;
       // truncate:false — pull the FULL above-threshold pool, not just the first
@@ -413,7 +414,19 @@ server.tool(
         caseInsensitive: case_insensitive
       });
 
-      const { results: rerankedFull, ranking_available } = applyCitationShapeRanking(result.results, targetDataset);
+      // Aboutness runs FIRST — before citation-shape reranking — since it
+      // establishes the primary sort order (by paper-level topic overlap);
+      // citation-shape then still tie-breaks WITHIN whatever comes out
+      // tied on weighted_score, which aboutness leaves completely
+      // untouched on every result (only a separate, internal adjusted
+      // score is used for aboutness's own sort). aboutness:false (default)
+      // is a no-op that just tags every result aboutness_factor:null, so
+      // this is safe to call unconditionally.
+      const aboutnessFull = aboutness
+        ? applyAboutnessReorder(result.results, targetDataset, result.token_weights).results
+        : result.results.map(r => ({ ...r, aboutness_factor: null, aboutness_matched_weight: null }));
+
+      const { results: rerankedFull, ranking_available } = applyCitationShapeRanking(aboutnessFull, targetDataset);
 
       // top_score_tied_count / fully_ranked: cheap diagnostics computed off
       // the full CITATION-SHAPE-reranked pool, before source capping —
@@ -461,7 +474,8 @@ server.tool(
             fully_ranked: fullyRanked,
             ranking_available,
             max_per_source: max_per_source || null,
-            demote_figures
+            demote_figures,
+            aboutness
           }, null, 2)
         }]
       };
