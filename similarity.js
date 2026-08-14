@@ -353,6 +353,31 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
  *   introduced by passing false: the full above-threshold set is already accumulated
  *   and sorted internally on every call regardless of `truncate` — this option only
  *   changes whether the tail gets cut here or left for the caller.
+ * @param {boolean} [options.caseInsensitive=false] - False (default) = exact
+ *   pre-v1.8.0 behaviour, byte-identical output: every token in `tokens_used`
+ *   is scored as its own fully independent requirement. When true, tokens
+ *   that differ only by case (e.g. "imaging" and "Imaging" — as produced by
+ *   a client deliberately sending both case forms of a word, since PQR
+ *   hashing is case-sensitive at the storage layer and each casing lives in
+ *   its own hash bucket) are grouped by lowercase form BEFORE weighting.
+ *   Each token in a group is still individually searched against DMM
+ *   exactly as before (no change to what gets searched or how many DMM
+ *   calls are made — see per-variant entries still present in
+ *   `timing.per_token`) but their matched-document sets are UNIONED into
+ *   one merged set, and ONE weight is computed from that merged set's size
+ *   (not one weight per case form). A document that matched only one
+ *   casing, or both, is credited with that single group weight exactly
+ *   once — never double-counted, and never required to match every case
+ *   form to get full credit. This also incidentally fixes the "phantom
+ *   token" failure mode where a duplicated case form exists nowhere in the
+ *   corpus (docCount 0, weight forced to 1 — see tokenWeight()'s docCount=0
+ *   note): merged into a group with a real variant, the union simply
+ *   equals the real variant's own doc set, so no permanently-unmatchable
+ *   weight gets baked into totalWeight. Diagnosed 2026-08-14 against
+ *   technique_08/dose_06/dose_08, which round-2 case-duplication (sending
+ *   both case forms as independent tokens, no merge) regressed to zero
+ *   results despite round-1 (no duplication) returning full result sets —
+ *   see dmm-round2-tuning notes.
  * @returns {Promise<SimilarityResult>}
  */
 async function similaritySearch(client, text, {
@@ -364,7 +389,8 @@ async function similaritySearch(client, text, {
   pqr = true,
   parallel = false,
   truncate = true,
-  weightPower = 1
+  weightPower = 1,
+  caseInsensitive = false
 } = {}) {
   const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
@@ -379,6 +405,7 @@ async function similaritySearch(client, text, {
       fpd: effectiveFpd,
       parallel,
       weight_power: weightPower,
+      case_insensitive: caseInsensitive,
       results: [],
       timing: {
         wall_clock_ms: 0,
@@ -456,11 +483,80 @@ async function similaritySearch(client, text, {
     }
   }
 
+  // Fold a GROUP of case-variant tokens (e.g. [{token:'imaging',...},
+  // {token:'Imaging',...}]) into the shared accumulators as ONE merged
+  // requirement, rather than one independent requirement per variant.
+  // Only used when caseInsensitive:true. Per-variant search/timing/billing
+  // bookkeeping is identical to accumulateToken (each variant's own DMM
+  // call(s) are still logged individually in perTokenTiming) — what
+  // differs is that docCount/weight/totalWeight/docScores/docHits are all
+  // computed ONCE from the UNION of every variant's matched documents,
+  // never per-variant. A document matching any variant (or several) is
+  // credited with the group's single weight exactly once.
+  function accumulateGroup(variants) {
+    const mergedRefs = new Map(); // stripped key -> original ref (first-seen wins)
+    const variantDiagnostics = [];
+
+    for (const { token, refs, calls } of variants) {
+      searched++;
+      let tokenTimeUsed = 0;
+      for (const c of calls) {
+        dmmCallsMade++;
+        if (typeof c.time_used === 'number') {
+          dmmTimeUsedTotal += c.time_used;
+          tokenTimeUsed += c.time_used;
+        }
+        if (typeof c.billing_units === 'number') dmmBillingUnitsTotal += c.billing_units;
+        if (c.energy_usage_kWh !== null) { energyDataSeen = true; energyKWhTotal += c.energy_usage_kWh; }
+        if (c.carbon_emissions_mg !== null) { energyDataSeen = true; carbonMgTotal += c.carbon_emissions_mg; }
+        if (c.equivalent_meters_driven !== null) { energyDataSeen = true; metersDrivenTotal += c.equivalent_meters_driven; }
+      }
+      perTokenTiming.push({
+        token,
+        calls,
+        token_time_used_sec: Math.round(tokenTimeUsed * 1000) / 1000
+      });
+      variantDiagnostics.push({ token, docCount: refs.length });
+
+      for (const ref of refs) {
+        const key = stripTimestamp(ref);
+        if (!mergedRefs.has(key)) mergedRefs.set(key, ref);
+      }
+    }
+
+    const docCount = mergedRefs.size; // size of the UNION — the merged, "case-insensitive" doc count
+    const weight = weighted ? tokenWeight(docCount, weightPower) : 1;
+    totalWeight += weight; // added ONCE per group, not once per variant
+
+    tokenInfo.push({
+      token: variants.length > 1 ? variants.map(v => v.token).join('/') : variants[0].token,
+      docCount,
+      weight: Math.round(weight * 1000) / 1000,
+      // Per-variant doc counts before the merge, so it's still visible how
+      // much (if anything) each individual casing contributed — omitted
+      // entirely for singleton groups so output for ordinary, non-case-
+      // duplicated tokens is unchanged.
+      ...(variants.length > 1 ? { variants: variantDiagnostics } : {})
+    });
+
+    for (const key of mergedRefs.keys()) {
+      docScores.set(key, (docScores.get(key) || 0) + weight);
+      docHits.set(key, (docHits.get(key) || 0) + 1); // +1 per merged CONCEPT matched, not per variant
+    }
+  }
+
+  // Every token is still searched individually against DMM exactly as
+  // before — caseInsensitive only changes how results get FOLDED into the
+  // accumulators afterward, never what gets searched or how many DMM calls
+  // are made. So the search step always collects one {token, refs, calls}
+  // result per token first; only the folding step below branches.
+  const perTokenResults = []; // in original tokens order; entries with failed searches are simply absent
+
   if (parallel) {
     // Fire every token's searchToken() concurrently. A per-token failure
     // still shouldn't abort the whole search, so failures are caught
     // per-promise (not via Promise.all's fail-fast behaviour) and resolved
-    // to a sentinel that accumulateToken() below simply skips.
+    // to a sentinel that's simply skipped below.
     const settled = await Promise.all(tokens.map(async (token) => {
       try {
         const searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
@@ -473,7 +569,7 @@ async function similaritySearch(client, text, {
 
     for (const entry of settled) {
       if (!entry.ok) continue;
-      accumulateToken(entry.token, entry.searchResult.refs, entry.searchResult.calls);
+      perTokenResults.push({ token: entry.token, refs: entry.searchResult.refs, calls: entry.searchResult.calls });
     }
   } else {
     for (const token of tokens) {
@@ -485,7 +581,30 @@ async function similaritySearch(client, text, {
         process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
         continue;
       }
-      accumulateToken(token, searchResult.refs, searchResult.calls);
+      perTokenResults.push({ token, refs: searchResult.refs, calls: searchResult.calls });
+    }
+  }
+
+  if (caseInsensitive) {
+    // Group by lowercase form, preserving first-seen group order, then
+    // fold each group as ONE merged requirement. A group of size 1 (a
+    // token with no case-variant partner in this query) behaves exactly
+    // like accumulateToken would have — union-of-one-set is just that
+    // set, so ordinary non-duplicated tokens see no change in scoring.
+    const groups = new Map(); // lowercase key -> array of {token, refs, calls}, in first-seen order
+    for (const r of perTokenResults) {
+      const key = r.token.toLowerCase();
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    for (const variants of groups.values()) {
+      accumulateGroup(variants);
+    }
+  } else {
+    // Default path — byte-identical to pre-v1.8.0 behaviour: every token
+    // is its own fully independent requirement, folded in original order.
+    for (const r of perTokenResults) {
+      accumulateToken(r.token, r.refs, r.calls);
     }
   }
 
@@ -515,7 +634,8 @@ async function similaritySearch(client, text, {
     fpd: effectiveFpd,
     parallel,
     weight_power: weightPower, // 1 = pre-v1.7.0 behaviour; see tokenWeight() header note
-    token_weights: tokenInfo, // per-token doc frequency + weight, for auditability
+    case_insensitive: caseInsensitive, // false = pre-v1.8.0 behaviour; see accumulateGroup() header note
+    token_weights: tokenInfo, // per-token (or, when case_insensitive:true, per-merged-group) doc frequency + weight, for auditability
     timing: {
       wall_clock_ms: wallClockMs,
       dmm_time_used_total_sec: Math.round(dmmTimeUsedTotal * 1000) / 1000,
