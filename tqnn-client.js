@@ -1,9 +1,11 @@
 // tqnn-client.js — Core DMM HTTP calls using multipart/form-data
-// TQNN MCP Server v1.5.0
+// TQNN MCP Server v1.9.0
 //
 // All DMM API calls use multipart/form-data, NOT JSON body.
 // Uses Node 18+ built-in FormData + fetch — no extra npm package needed.
 // For tqnn.local (self-signed cert): set NODE_TLS_REJECT_UNAUTHORIZED=0 in env.
+
+const crypto = require('crypto');
 
 class TQNNClient {
   constructor({ baseUrl, apiKey, apiSecret, dataset = '' }) {
@@ -64,14 +66,33 @@ class TQNNClient {
 
   /**
    * Lightweight connectivity ping using a known-harmless token.
-   * Uses self-salting PQR scheme (V1.3.0+) — matches tqnnToken16() in similarity.js.
-   * Sends `dataset` (this.dataset) the same way searchDoc()/storeDoc() do —
-   * required so tqnn_acl_gate() has a dataset to check under sub-credentials.
-   * Owner credentials aren't affected (Stage 2 bypasses the check for them).
+   *
+   * v1.9.0 — DELIBERATELY does NOT use the real (keyed) PQR pipeline from
+   * similarity.js. Two reasons:
+   *
+   *   1. ping() exists purely to check "is DMM reachable" — nothing reads
+   *      or cares about the specific hash value it sends, it's disposable
+   *      on every call. It carries no real PII and protects nothing.
+   *   2. Making it depend on similarity.js's pqrHash() would mean
+   *      tqnn_status (a basic health check) hard-fails with a "TQNN_PQR_KEY
+   *      not configured" error on any deployment that hasn't set up PQR
+   *      yet — even one that only ever uses pqr:false raw-token mode and
+   *      has no reason to configure a PQR key at all. A connectivity probe
+   *      shouldn't have a hard dependency on an unrelated, optional
+   *      feature's configuration.
+   *
+   * This previously reimplemented the V1.3.0 self-salting hash chain
+   * inline as its own second copy of that algorithm — a duplication risk
+   * once similarity.js's real algorithm changed (as it just did, to the
+   * keyed V1.9.0 scheme). Keeping a SEPARATE, clearly-labelled, non-keyed
+   * sentinel hash here — rather than silently re-copying whatever
+   * similarity.js does this week — makes the "this is not the security
+   * path" property explicit instead of accidental. If similarity.js's
+   * algorithm changes again, this function does NOT need to change to
+   * match it, and that's intentional, not drift.
    * @returns {Promise<ApiResponse>}
    */
   async ping() {
-    const crypto   = require('crypto');
     const input    = '__ping__';
     const h1       = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
     const padded   = (input + h1).slice(0, 16);
@@ -81,18 +102,6 @@ class TQNNClient {
       ...(this.dataset ? { dataset: this.dataset } : {})
     });
   }
-
-  /*
-   * SUPERSEDED — V1.0.x constant-padding ping
-   *
-   * async ping() {
-   *   const crypto = require('crypto');
-   *   const token = '__ping__';
-   *   const padded = token.length >= 16 ? token.slice(0, 16) : token.padEnd(16, '*');
-   *   const pingHash = crypto.createHash('sha256').update(padded, 'utf8').digest('hex');
-   *   return this._post('/v1/searchDoc', { pattern: pingHash });
-   * }
-   */
 
   /**
    * Discover which datasets the caller's own credentials can access.

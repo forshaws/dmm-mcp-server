@@ -1,5 +1,5 @@
 // similarity.js — Multi-call similarity orchestration for TQNN DMM
-// TQNN MCP Server v1.4.0
+// TQNN MCP Server v1.9.0
 //
 // The similarity search algorithm lives entirely here — NOT inside DMM.
 // DMM only sees individual searchDoc calls with PQR-hashed tokens.
@@ -36,8 +36,8 @@
 //
 // v1.7.0 — Optional weightPower exponent (opt-in, default unchanged)
 //   Root cause diagnosed 2026-08-11 against three real benchmark failures
-//   (anatomy_06, guideline_01, guideline_10 — Radiology Academy 130-query
-//   set): tokenWeight()'s log-dampening is deliberately narrow (a rare
+//   (anatomy_06, guideline_01, guideline_10 — a 130-query internal
+//   benchmark set): tokenWeight()'s log-dampening is deliberately narrow (a rare
 //   token like "bronchopulmonary", docCount 1566, only gets weight ~0.094
 //   vs ~0.055-0.068 for generic query words like "chest"/"CT"/"anatomy" —
 //   under 2x spread). Since scores are a plain SUM of matched weights, a
@@ -70,33 +70,157 @@ const crypto = require('crypto');
 const { tokenise } = require('./tokeniser');
 
 // ---------------------------------------------------------------------------
-// PQR Hashing — Self-Salting scheme (V1.3.0+)
+// PQR Hashing — Self-Salting scheme, with opt-in Keyed (HMAC) mode (V1.9.0+)
 //
-// Algorithm (mirrors storeDoc.php / tqnn_dmm_ide.html exactly):
-//   1. h1     = SHA-256(input)          — 64 hex chars; endogenous salt
-//   2. mixed  = input + h1              — salt appended to input
-//   3. padded = mixed.slice(0, 16)      — first 16 chars
-//   4. token  = SHA-256(padded).slice(0,16)
+// WHAT'S NEW IN V1.9.0: an opt-in `hmac` flag, default FALSE.
 //
-// Properties:
-//   • Defeats rainbow tables — salt is derived from input itself
-//   • All inputs lifted into full 2^256 hash space regardless of entropy
-//   • No external key material, zero storage overhead, fully deterministic
+//   hmac:false (default) — EXACT V1.3.0 behaviour, byte-identical output.
+//     Self-salts from the input alone (h1 = SHA256(input)), no key
+//     required, no config needed. Every dataset ingested before this
+//     version — including an already-running Lindisfarne corpus — keeps
+//     working with zero changes. This mode is still a pure, public
+//     function of the plaintext: see the security note below before
+//     relying on it for anything beyond continuity with existing data.
 //
-// IMPORTANT: Re-ingest required for any dataset stored under the old '*' scheme.
+//   hmac:true — folds a secret, per-deployment key (TQNN_PQR_KEY) into
+//     both hash steps via HMAC-SHA256 instead of plain SHA256. Requires
+//     TQNN_PQR_KEY to be configured; throws (fails closed) if it isn't.
+//
+// hmac MUST match between store and search, exactly like pqr and fpd
+// already have to — hmac:true tokens will never match hmac:false tokens
+// for the same input, by design (that's the whole point of adding a key).
+//
+// WHY hmac:true EXISTS AT ALL — THE SECURITY CASE:
+//
+// The hmac:false scheme derives its "salt" entirely from the input itself,
+// with no secret anywhere in the computation. That makes tqnnToken16() a
+// pure, public function of the plaintext: input -> token, fully
+// determined, no key material required to compute it. Anyone who knows
+// the algorithm (published in the DMMPQR whitepaper, and in this file)
+// can:
+//
+//   1. Take a candidate PII value (a name, a DOB, an NHS number, anything
+//      from a breach list or census), run it through the published formula
+//      themselves, and check whether the result appears in a stolen token
+//      store — no brute-force search of the output space required, no
+//      quantum computer required, just a direct, targeted computation.
+//   2. Build that lookup table ONCE and reuse it against every DMM
+//      deployment on earth, because the same input always produces the
+//      same token everywhere — there was nothing deployment-specific in
+//      the computation to stop reuse.
+//
+// This is a classical dictionary attack, not a preimage/brute-force attack,
+// so the whitepaper's Grover-cost analysis (scoped to blind inversion of
+// the full 64-bit output space) doesn't cover it, and no amount of
+// truncation-width or circuit-depth argument changes it. The original
+// "self-salting" fix (replacing a constant pad with an input-derived one)
+// addressed a DIFFERENT problem — it stopped one precomputed table from
+// being reused against a fixed constant pad across deployments — but it
+// never introduced a secret, so it never stopped a fresh per-deployment
+// dictionary attack computed directly against the published formula.
+//
+// hmac:true closes that gap by folding a secret, per-deployment key into
+// both hash steps. Without the key, an attacker cannot compute a
+// candidate's token at all — they would have to recover a full 256-bit
+// HMAC key, a completely different and far harder problem than guessing
+// a low-entropy PII field.
+//
+// Algorithm (hmac:true):
+//   1. h1     = HMAC-SHA256(key, input)   — 64 hex chars; keyed salt
+//   2. mixed  = input + h1                — salt appended to input
+//   3. padded = mixed.slice(0, 16)        — first 16 chars
+//   4. token  = HMAC-SHA256(key, padded).slice(0, 16)
+//
+// Algorithm (hmac:false, unchanged from V1.3.0):
+//   1. h1     = SHA256(input)             — 64 hex chars; input-derived salt
+//   2. mixed  = input + h1                — salt appended to input
+//   3. padded = mixed.slice(0, 16)        — first 16 chars
+//   4. token  = SHA256(padded).slice(0, 16)
+//
+// *** MIGRATION PLAN ***
+// hmac:false is the default specifically so existing corpora (Lindisfarne
+// and anything else already ingested under V1.3.0) keep working with zero
+// config while a re-ingest under hmac:true is scheduled. Once re-ingested,
+// flip the calling side's default to hmac:true (tqnn_search/tqnn_similarity/
+// tqnn_store) so new writes and reads use the keyed scheme going forward.
+// Until then, hmac:false carries the same dictionary-attack exposure
+// described above — it is a continuity bridge, not a fix, and shouldn't be
+// treated as the end state.
+//
+// *** ALSO CHECK ***
+// This file's original V1.3.0 header claimed the algorithm "mirrors
+// storeDoc.php / tqnn_dmm_ide.html exactly" — i.e. at least two other
+// codebases (the DMM appliance's PHP backend, and the Workbench IDE's
+// browser-side JS) may independently reimplement this same hash chain.
+// CONFIRM whether either does its own PQR hashing server-/tool-side. If
+// so, both need the same hmac:true option and the same key, or tokens
+// computed through those paths will silently diverge from tokens computed
+// here — a mismatch that would surface only as "no results", with no
+// error message pointing at the real cause.
 // ---------------------------------------------------------------------------
 
+let _pqrKeyCache = null;
+
 /**
- * Self-Salting PQR token — canonical implementation.
+ * Resolve the PQR HMAC key from TQNN_PQR_KEY (env), cached after first
+ * successful read. Only ever called when hmac:true.
+ *
+ * Deliberately fails closed: if no key (or too short a key) is configured,
+ * this throws rather than silently falling back to hmac:false. Falling
+ * back automatically would mean a caller who explicitly asked for hmac:true
+ * could be silently downgraded to the precomputable scheme without knowing
+ * it — the point of an explicit flag is that the caller's choice is
+ * honoured or the call fails, never quietly substituted.
+ *
+ * @returns {Buffer}
+ */
+function getPqrKey() {
+  if (_pqrKeyCache) return _pqrKeyCache;
+  const raw = process.env.TQNN_PQR_KEY || '';
+  if (raw.length < 32) {
+    throw new Error(
+      'TQNN_PQR_KEY is missing or too short (need ≥ 32 chars). hmac:true requires a ' +
+      'per-deployment secret key and will not silently fall back to hmac:false. ' +
+      'Generate one with:\n' +
+      '  node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'base64\'))"\n' +
+      'and set TQNN_PQR_KEY=<value> in .env — or pass hmac:false (or omit hmac) to use ' +
+      'the existing unkeyed scheme against already-ingested data.'
+    );
+  }
+  _pqrKeyCache = Buffer.from(raw, 'utf8');
+  return _pqrKeyCache;
+}
+
+/**
+ * Self-Salting PQR token. hmac:false (default) is byte-identical to the
+ * original V1.3.0 scheme — no key needed, matches any data already
+ * ingested under it. hmac:true folds in a secret per-deployment key via
+ * HMAC-SHA256 — see the header note above for why, and for the migration
+ * plan from one to the other.
  * @param {string} s - Input token (will be trimmed)
+ * @param {object} [opts]
+ * @param {boolean} [opts.hmac=false] - Use the keyed construction.
+ * @param {Buffer|string} [opts.key] - HMAC key override (else TQNN_PQR_KEY
+ *   from env via getPqrKey()). Only read when hmac:true. Exposed mainly so
+ *   tests can pass a fixed key without touching process.env.
  * @returns {string} 16-char hex token
  */
-function tqnnToken16(s) {
-  const input  = String(s).trim();
-  const h1     = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
-  const mixed  = input + h1;
-  const padded = mixed.slice(0, 16);
-  return crypto.createHash('sha256').update(padded, 'utf8').digest('hex').slice(0, 16);
+function tqnnToken16(s, { hmac = false, key } = {}) {
+  const input = String(s).trim();
+
+  if (!hmac) {
+    // Unkeyed V1.3.0 scheme — unchanged, no key required.
+    const h1     = crypto.createHash('sha256').update(input, 'utf8').digest('hex');
+    const mixed  = input + h1;
+    const padded = mixed.slice(0, 16);
+    return crypto.createHash('sha256').update(padded, 'utf8').digest('hex').slice(0, 16);
+  }
+
+  const hmacKey = key || getPqrKey();
+  const h1       = crypto.createHmac('sha256', hmacKey).update(input, 'utf8').digest('hex');
+  const mixed    = input + h1;
+  const padded   = mixed.slice(0, 16);
+  return crypto.createHmac('sha256', hmacKey).update(padded, 'utf8').digest('hex').slice(0, 16);
 }
 
 /*
@@ -112,10 +236,11 @@ function tqnnToken16(s) {
 /**
  * PQR hash — forward (standard).
  * @param {string} token
+ * @param {boolean} [hmac=false] - See tqnnToken16().
  * @returns {string} 16-char hex token
  */
-function pqrHash(token) {
-  return tqnnToken16(token);
+function pqrHash(token, hmac = false) {
+  return tqnnToken16(token, { hmac });
 }
 
 /*
@@ -129,11 +254,18 @@ function pqrHash(token) {
  * PQR hash — reversed INPUT string (for FPD).
  * IMPORTANT: We reverse the token INPUT string before self-salting.
  * NOT the hash output. This mirrors the PHP/JS FPD implementations.
+ *
+ * Note: FPD is a false-positive-rate / precision feature (it filters out
+ * 64-bit truncation collisions), not a security control — reversing a
+ * candidate string is exactly as cheap for an attacker as hashing it
+ * forwards, so this does not raise attack cost either way. hmac:true is
+ * what raises attack cost; FPD does not.
  * @param {string} token
+ * @param {boolean} [hmac=false] - See tqnnToken16().
  * @returns {string} 16-char hex token
  */
-function pqrHashReversed(token) {
-  return tqnnToken16(token.split('').reverse().join(''));
+function pqrHashReversed(token, hmac = false) {
+  return tqnnToken16(token.split('').reverse().join(''), { hmac });
 }
 
 /*
@@ -233,11 +365,13 @@ function tokenWeight(docCount, power = 1) {
  * @param {boolean} [pqr=true] - PQR-hash the token before searching. Set false to search the
  *   raw token directly — for records stored via tqnn_store pqr:false (DMM's own storeDoc.php
  *   tokenises/keys every value regardless, so no client-side hashing is needed on this path).
+ * @param {boolean} [hmac=false] - Use the keyed HMAC PQR construction instead of the unkeyed
+ *   V1.3.0 scheme. Ignored when pqr:false. Must match how the target record was stored.
  * @returns {Promise<{refs: string[], calls: Array<{pass: string, time_used: number|null, billing_units: number|null, fc: number|null}>}>}
  *   refs: original filereference strings (with timestamp), same as pre-v1.5.0's bare return.
  *   calls: one entry per DMM searchDoc call actually made for this token (1 normally, 2 under FPD).
  */
-async function searchToken(client, token, fpd, dataset, pqr = true) {
+async function searchToken(client, token, fpd, dataset, pqr = true, hmac = false) {
   const calls = [];
 
   // DMM's raw response carries time_used (seconds), billing_units, fc
@@ -270,7 +404,7 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
     return { refs: [...fwdRefs.values()], calls };
   }
 
-  const fwdResult = await client.searchDoc(pqrHash(token), dataset);
+  const fwdResult = await client.searchDoc(pqrHash(token, hmac), dataset);
   recordCall('forward', fwdResult);
   const fwdRefs = new Map(); // stripped → original
   for (const ref of parseFilelist(fwdResult)) {
@@ -280,7 +414,7 @@ async function searchToken(client, token, fpd, dataset, pqr = true) {
   if (!fpd) return { refs: [...fwdRefs.values()], calls };
 
   // FPD: reverse the token INPUT string, hash it, search again
-  const revResult = await client.searchDoc(pqrHashReversed(token), dataset);
+  const revResult = await client.searchDoc(pqrHashReversed(token, hmac), dataset);
   recordCall('reverse', revResult);
   const revStripped = new Set(parseFilelist(revResult).map(stripTimestamp));
 
@@ -387,11 +521,30 @@ async function similaritySearch(client, text, {
   maxResults = 20,
   weighted = true,
   pqr = true,
+  hmac = false,
   parallel = false,
   truncate = true,
   weightPower = 1,
   caseInsensitive = false
 } = {}) {
+  // v1.9.0 — fail fast on a missing/invalid PQR key, ONCE, up front, but
+  // ONLY when hmac:true was actually requested. hmac defaults to false, so
+  // by default this never fires and existing data (ingested under the
+  // unkeyed V1.3.0 scheme, e.g. an already-loaded Lindisfarne corpus) keeps
+  // working with zero config.
+  //
+  // Without this eager check, a missing key on an hmac:true call would
+  // manifest as tqnnToken16() throwing deep inside searchToken(), which is
+  // called from inside a catch-and-continue loop below (both the sequential
+  // and parallel branches log the error to stderr and skip that token
+  // rather than propagating it). That means the caller would just see
+  // "0 tokens matched" / an empty result set — a confusing "no results"
+  // failure mode with no indication the real cause was a missing key, not
+  // an empty corpus. Checking here instead lets the error reach the MCP
+  // tool handler's own try/catch in index.js and come back to the caller
+  // as a clear, single error message.
+  if (pqr && hmac) getPqrKey();
+
   const effectiveFpd = pqr ? fpd : false;
   const tokens = tokenise(text);
   if (tokens.length === 0) {
@@ -402,6 +555,7 @@ async function similaritySearch(client, text, {
       threshold_pct: threshold * 100,
       weighted,
       pqr,
+      hmac,
       fpd: effectiveFpd,
       parallel,
       weight_power: weightPower,
@@ -559,7 +713,7 @@ async function similaritySearch(client, text, {
     // to a sentinel that's simply skipped below.
     const settled = await Promise.all(tokens.map(async (token) => {
       try {
-        const searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
+        const searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr, hmac);
         return { token, ok: true, searchResult };
       } catch (err) {
         process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
@@ -575,7 +729,7 @@ async function similaritySearch(client, text, {
     for (const token of tokens) {
       let searchResult;
       try {
-        searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr);
+        searchResult = await searchToken(client, token, effectiveFpd, dataset, pqr, hmac);
       } catch (err) {
         // Log and continue — one failed token shouldn't abort the whole search
         process.stderr.write(`[tqnn-similarity] token "${token}" search failed: ${err.message}\n`);
@@ -631,6 +785,7 @@ async function similaritySearch(client, text, {
     threshold_pct: threshold * 100,
     weighted,
     pqr,
+    hmac,
     fpd: effectiveFpd,
     parallel,
     weight_power: weightPower, // 1 = pre-v1.7.0 behaviour; see tokenWeight() header note
@@ -657,6 +812,7 @@ module.exports = {
   pqrHash,
   pqrHashReversed,
   tqnnToken16,
+  getPqrKey,
   searchToken,
   parseFilelist,
   stripTimestamp,
