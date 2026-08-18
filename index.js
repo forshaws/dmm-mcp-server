@@ -1,5 +1,5 @@
 // index.js — TQNN DMM MCP Server
-// TQNN MCP Server v1.5.0
+// TQNN MCP Server v1.9.0
 //
 // Exposes TQNN DMM associative memory as MCP tools for Claude and other
 // MCP-compatible LLMs.
@@ -63,13 +63,40 @@ const CONFIG = {
   mode:       (process.env.MCP_MODE        || 'stdio').toLowerCase(),
   port:       parseInt(process.env.MCP_PORT || '3100', 10),
   publicUrl:  process.env.TQNN_PUBLIC_URL  || '',   // e.g. https://sprint-umpire-wrongdoer.ngrok-free.dev
-  mcpSecret:  process.env.TQNN_MCP_SECRET  || '',   // HMAC secret for token signing
+  mcpSecret:  process.env.TQNN_MCP_SECRET  || '',   // HMAC secret for OAuth bearer-token signing (NOT the PQR key — see TQNN_PQR_KEY below, a separate secret for a separate trust boundary)
   oauthUser:  process.env.TQNN_OAUTH_USER  || 'admin',
   oauthPass:  process.env.TQNN_OAUTH_PASS  || '',   // plaintext from .env, hashed immediately
+  pqrKey:     process.env.TQNN_PQR_KEY     || '',   // HMAC key for PQR content tokenisation — see similarity.js's getPqrKey()
 };
 
 if (!CONFIG.apiKey || !CONFIG.apiSecret) {
   process.stderr.write('[tqnn-mcp] WARNING: TQNN_API_KEY or TQNN_API_SECRET not set\n');
+}
+
+// v1.9.0 — PQR is opt-in per call (pqr:true on tqnn_search/tqnn_similarity/
+// tqnn_store), and now hmac:true is a further opt-in on TOP of pqr:true
+// (default false — see similarity.js's V1.9.0 header). So this is an
+// informational note, not a warning: a deployment that never passes
+// hmac:true (including one still running entirely on data ingested before
+// this version, e.g. an existing Lindisfarne corpus under pqr:true/
+// hmac:false) has no reason to configure this yet, and nothing breaks by
+// leaving it unset. Only a call that explicitly passes hmac:true without
+// TQNN_PQR_KEY set will fail (similarity.js's getPqrKey() throws) — this
+// note just makes the key's existence and purpose easy to find before
+// that becomes a live question.
+if (!CONFIG.pqrKey || CONFIG.pqrKey.length < 32) {
+  process.stderr.write(
+    '[tqnn-mcp] NOTE: TQNN_PQR_KEY not set (or under 32 chars). Not required unless a tool ' +
+    'call explicitly passes hmac:true (tqnn_search, tqnn_similarity, tqnn_store) — pqr:true ' +
+    'alone (the current default, and what any pre-existing corpus was ingested under) still ' +
+    'works with no key, using the unkeyed self-salting scheme. hmac:true is the keyed, ' +
+    'dictionary-attack-resistant option for NEW ingests going forward. Generate a key with:\n' +
+    '  node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'base64\'))"\n' +
+    '[tqnn-mcp]       Set TQNN_PQR_KEY=<value> in .env when ready to start using hmac:true.\n' +
+    '[tqnn-mcp]       NOTE: hmac:true and hmac:false produce different tokens for identical ' +
+    'input, by design — search and store must use the same hmac setting, and switching an ' +
+    'existing corpus over means re-ingesting it under hmac:true.\n'
+  );
 }
 
 // ── Per-employee DMM credential resolution ──────────────────────────────────────
@@ -150,7 +177,7 @@ function getClientFor(authResult) {
 function createMcpServer(authResult) {
   const server = new McpServer({
     name: 'tqnn-dmm',
-    version: '1.5.0'
+    version: '1.9.0'
   });
 
   // Resolved once per connection (matches the per-connection McpServer factory
@@ -243,18 +270,19 @@ server.tool(
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within. Overrides server default.'),
     return_filelist: z.number().int().min(0).max(1).default(1).optional().describe('Set to 1 to return full filelist. Default 1.'),
     pqr: z.boolean().default(false).optional().describe('PQR-hash the query before searching. Default false, matching the DMM REST API and Workbench, where PQR is opt-in — set true to hash the query, and it must match how the target record was stored (tqnn_store pqr:true).'),
+    hmac: z.boolean().default(false).optional().describe('When pqr:true, use the keyed HMAC construction instead of the unkeyed self-salting scheme. Default false — matches data ingested before this option existed (e.g. an existing corpus), no server key required. Set true only for data stored with tqnn_store pqr:true hmac:true; requires TQNN_PQR_KEY configured server-side, and will error clearly if missing. Ignored when pqr:false.'),
     fpd: z.boolean().default(false).optional().describe('Enable False Positive Defence — makes a second search on the reversed-input hash and returns only filereferences present in both, filtering out hash collisions. Default false, matching the API/Workbench default; set true for higher-confidence results at the cost of a second DMM call. Only applies when pqr:true (ignored, and reported as false, when pqr:false — there is no hash to reverse).')
   },
-  async ({ query, dataset, return_filelist = 1, pqr = false, fpd = false }) => {
+  async ({ query, dataset, return_filelist = 1, pqr = false, hmac = false, fpd = false }) => {
     try {
       const trimmed = query.trim();
-      const hash = pqr ? pqrHash(trimmed) : trimmed;
+      const hash = pqr ? pqrHash(trimmed, hmac) : trimmed;
       const result = await client.searchDoc(hash, dataset);
       let filelist = (result.filelist || '').split('\n').map(r => r.trim()).filter(Boolean);
 
       const fpdApplied = pqr && fpd;
       if (fpdApplied) {
-        const revResult = await client.searchDoc(pqrHashReversed(trimmed), dataset);
+        const revResult = await client.searchDoc(pqrHashReversed(trimmed, hmac), dataset);
         const revStripped = new Set(
           (revResult.filelist || '').split('\n').map(r => r.trim()).filter(Boolean).map(stripTimestamp)
         );
@@ -267,6 +295,7 @@ server.tool(
           text: JSON.stringify({
             query,
             pqr_enabled: pqr,
+            hmac_enabled: pqr && hmac,
             pqr_hash: pqr ? hash : null,
             fpd_enabled: fpdApplied,
             result_count: filelist.length,
@@ -293,16 +322,18 @@ server.tool(
     threshold: z.number().min(0).max(1).default(0.4).optional().describe('Token overlap threshold 0.0–1.0. Default 0.4 (40% of tokens must match).'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace to search within.'),
     pqr: z.boolean().default(true).optional().describe('PQR-hash each token before searching. Default true. Set false to run plain (unhashed) similarity search — for records stored via tqnn_store pqr:false. Equivalent to calling tqnn_similarity_plain. Forces fpd off when false (there is no hash to reverse).'),
+    hmac: z.boolean().default(false).optional().describe('When pqr:true, use the keyed HMAC construction instead of the unkeyed self-salting scheme. Default false — matches data ingested before this option existed (e.g. an existing corpus), no server key required. Set true only for data stored with tqnn_store pqr:true hmac:true; requires TQNN_PQR_KEY configured server-side, and will error clearly (not silently return zero matches) if missing. Ignored when pqr:false.'),
     fpd: z.boolean().default(true).optional().describe('Enable False Positive Defence. Default true. Recommended to leave on. Ignored, and reported as false, when pqr:false.'),
     max_results: z.number().int().min(1).max(100).default(20).optional().describe('Maximum number of file references to return. Default 20.'),
     parallel: z.boolean().default(false).optional().describe('Search all query tokens concurrently instead of one-at-a-time. Default false. Same results/ranking either way — only changes how many simultaneous requests hit the DMM appliance, so test against your appliance before enabling under load.')
   },
-  async ({ text, threshold = 0.4, dataset, pqr = true, fpd = true, max_results = 20, parallel = false }) => {
+  async ({ text, threshold = 0.4, dataset, pqr = true, hmac = false, fpd = true, max_results = 20, parallel = false }) => {
     try {
       const result = await similaritySearch(client, text, {
         threshold,
         dataset: dataset || CONFIG.dataset,
         pqr,
+        hmac,
         fpd,
         maxResults: max_results,
         parallel
@@ -367,10 +398,11 @@ server.tool(
     pattern: z.string().describe('JSON array of metadata objects e.g. [{"title":"Report","year":2024}]. Stored raw by default; set pqr:true to tokenise and PQR-hash field values before storage.'),
     dataset: z.string().optional().describe('Optional: target dataset/namespace.'),
     pqr: z.boolean().default(false).optional().describe('Enable PQR hashing of pattern field values before storage. Default false, matching the DMM REST API and Workbench, where PQR is opt-in. Must match search mode.'),
+    hmac: z.boolean().default(false).optional().describe('When pqr:true, use the keyed HMAC construction instead of the unkeyed self-salting scheme. Default false, matching pre-existing ingested data (e.g. an existing corpus) — no server key required. Set true to start a migration to keyed tokens for NEW records; requires TQNN_PQR_KEY configured server-side. Must match hmac setting used on the corresponding search calls. Ignored when pqr:false.'),
     fpd: z.boolean().default(false).optional().describe('Enable False Positive Defence — stores both forward and reversed-input hashes per token. Default false, matching the API/Workbench default. Required for tqnn_similarity with fpd:true, and for tqnn_search with fpd:true.'),
     create_ots: z.boolean().default(false).optional().describe('Submit SHA-256 fingerprint to OpenTimestamps Bitcoin calendar for blockchain anchoring.')
   },
-  async ({ filereference, pattern, dataset, pqr = false, fpd = false, create_ots = false }) => {
+  async ({ filereference, pattern, dataset, pqr = false, hmac = false, fpd = false, create_ots = false }) => {
     try {
       // ── Parse and validate pattern ──────────────────────────────────────────
       let parsedPattern;
@@ -424,12 +456,12 @@ server.tool(
         }
 
         // Forward store: hash each token, build pattern array DMM expects
-        const fwdTokens = [...allTokens].map(tok => ({ token: pqrHash(tok) }));
+        const fwdTokens = [...allTokens].map(tok => ({ token: pqrHash(tok, hmac) }));
         storePattern = JSON.stringify(fwdTokens);
 
         // FPD reverse store: reverse each token INPUT string before hashing
         if (fpd) {
-          const revTokens = [...allTokens].map(tok => ({ token: pqrHashReversed(tok) }));
+          const revTokens = [...allTokens].map(tok => ({ token: pqrHashReversed(tok, hmac) }));
           fpdPattern = JSON.stringify(revTokens);
         }
       } else {
@@ -461,6 +493,7 @@ server.tool(
             success,
             filereference: ref,
             pqr_enabled: pqr,
+            hmac_enabled: pqr && hmac,
             fpd_enabled: fpd,
             tokens_stored: pqr ? JSON.parse(storePattern).length : null,
             forward_store: { ok: fwdOk, dmm_response: fwdResult },
@@ -598,7 +631,7 @@ async function startSSE() {
       res.end(JSON.stringify({
         status: 'ok',
         server: 'tqnn-mcp-server',
-        version: '1.5.0',
+        version: '1.9.0',
         auth: 'oauth2.1',
         base_url: CONFIG.baseUrl,
         dataset: CONFIG.dataset || '(default)'
