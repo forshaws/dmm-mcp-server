@@ -12,8 +12,8 @@
 //   searched dataset. A token that hits 900 documents and a token that
 //   hits 2 documents counted identically. This meant common tokens (e.g.
 //   a protagonist's name repeated throughout a book, or a generic word
-//   like "Diabetes" in a clinical corpus) could dominate ranking over
-//   genuinely discriminating tokens (e.g. "Hatter", "lymphoma").
+//   repeated throughout a domain-specific corpus) could dominate ranking
+//   over genuinely discriminating, rarer tokens.
 //
 //   v1.4.0 introduces log-dampened inverse-document-frequency weighting:
 //   rarer tokens (fewer matching documents) contribute more to a
@@ -36,16 +36,15 @@
 //
 // v1.7.0 — Optional weightPower exponent (opt-in, default unchanged)
 //   Root cause diagnosed 2026-08-11 against three real benchmark failures
-//   (anatomy_06, guideline_01, guideline_10 — a 130-query internal
-//   benchmark set): tokenWeight()'s log-dampening is deliberately narrow (a rare
-//   token like "bronchopulmonary", docCount 1566, only gets weight ~0.094
-//   vs ~0.055-0.068 for generic query words like "chest"/"CT"/"anatomy" —
-//   under 2x spread). Since scores are a plain SUM of matched weights, a
-//   document matching 6 generic words can and does outscore a document
-//   matching 5 words including the one rare, actually-diagnostic term —
-//   confirmed live: anatomy_06's wrong top-1 (missing "bronchopulmonary")
-//   scored 0.381; the real bronchopulmonary-containing document scored
-//   0.357, only 0.024 behind, sitting at rank 3 of 50 rather than 1.
+//   (a 130-query internal benchmark set): tokenWeight()'s log-dampening
+//   is deliberately narrow (a rare token, docCount 1566, only gets weight
+//   ~0.094 vs ~0.055-0.068 for generic query words — under 2x spread).
+//   Since scores are a plain SUM of matched weights, a document matching
+//   6 generic words can and does outscore a document matching 5 words
+//   including the one rare, actually-discriminating term — confirmed
+//   live: one query's wrong top-1 (missing the rare term) scored 0.381;
+//   the real matching document scored 0.357, only 0.024 behind, sitting
+//   at rank 3 of 50 rather than 1.
 //
 //   New optional `weightPower` (default 1 = exact pre-v1.7.0 behaviour,
 //   byte-identical output) raises each token's log-dampened weight to
@@ -53,18 +52,17 @@
 //   relative to common ones. Applied inside tokenWeight() itself, so
 //   totalWeight/threshold/overlap_pct — which all derive from the same
 //   per-token weight value — stay internally consistent automatically;
-//   no other code path needed changing. Verified against real
-//   anatomy_06 data: weightPower=2 flips the two documents above
-//   (0.0244 vs 0.0264, real bronchopulmonary-containing doc wins) using
-//   the corpus's own real per-token weights, not simulated data.
+//   no other code path needed changing. Verified against real benchmark
+//   data: weightPower=2 flips the two documents above (0.0244 vs 0.0264,
+//   the real matching doc wins) using the corpus's own real per-token
+//   weights, not simulated data.
 //
-//   NOT yet validated against the known-good query set (physics_03,
-//   dose_03, dose_06, diagnostic_01, protocol_10) or the other two
-//   bag-of-tokens failures (guideline_01, guideline_10) — that
-//   regression pass is the reason this ships opt-in (default 1, old
-//   ranking unchanged) rather than replacing the default outright.
-//   Intended workflow: run the benchmark twice, once at the default and
-//   once with weightPower passed through, and diff.
+//   NOT yet validated against the full known-good query set or the
+//   other two bag-of-tokens failures — that regression pass is the
+//   reason this ships opt-in (default 1, old ranking unchanged) rather
+//   than replacing the default outright. Intended workflow: run the
+//   benchmark twice, once at the default and once with weightPower
+//   passed through, and diff.
 
 const crypto = require('crypto');
 const { tokenise } = require('./tokeniser');
@@ -77,7 +75,7 @@ const { tokenise } = require('./tokeniser');
 //   hmac:false (default) — EXACT V1.3.0 behaviour, byte-identical output.
 //     Self-salts from the input alone (h1 = SHA256(input)), no key
 //     required, no config needed. Every dataset ingested before this
-//     version — including an already-running Lindisfarne corpus — keeps
+//     version — including an already-running production corpus — keeps
 //     working with zero changes. This mode is still a pure, public
 //     function of the plaintext: see the security note below before
 //     relying on it for anything beyond continuity with existing data.
@@ -99,8 +97,8 @@ const { tokenise } = require('./tokeniser');
 // the algorithm (published in the DMMPQR whitepaper, and in this file)
 // can:
 //
-//   1. Take a candidate PII value (a name, a DOB, an NHS number, anything
-//      from a breach list or census), run it through the published formula
+//   1. Take a candidate PII value (a name, a DOB, a government ID number,
+//      anything from a breach list or census), run it through the published formula
 //      themselves, and check whether the result appears in a stolen token
 //      store — no brute-force search of the output space required, no
 //      quantum computer required, just a direct, targeted computation.
@@ -138,8 +136,8 @@ const { tokenise } = require('./tokeniser');
 //   4. token  = SHA256(padded).slice(0, 16)
 //
 // *** MIGRATION PLAN ***
-// hmac:false is the default specifically so existing corpora (Lindisfarne
-// and anything else already ingested under V1.3.0) keep working with zero
+// hmac:false is the default specifically so existing corpora (any
+// production dataset already ingested under V1.3.0) keep working with zero
 // config while a re-ingest under hmac:true is scheduled. Once re-ingested,
 // flip the calling side's default to hmac:true (tqnn_search/tqnn_similarity/
 // tqnn_store) so new writes and reads use the keyed scheme going forward.
@@ -326,7 +324,7 @@ function stripTimestamp(ref) {
  * unchanged). Raising the log-dampened weight to a power >1 before it
  * gets summed with other tokens' weights makes rare/high-value tokens
  * dominate more over several common-word matches — see the v1.7.0 header
- * note above for the real anatomy_06 case this targets. docCount=0's
+ * note above for the real benchmark case this targets. docCount=0's
  * weight of exactly 1 is unaffected by any power (1^n = 1), so the
  * "effectively required" threshold behaviour for a totally-absent token
  * is preserved at every power value.
@@ -472,8 +470,8 @@ async function searchToken(client, token, fpd, dataset, pqr = true, hmac = false
  *   document's score. 1 = exact pre-v1.7.0 behaviour, byte-identical output.
  *   Values >1 (e.g. 2) let rare/high-value tokens dominate more heavily over
  *   several common-word matches — opt-in prototype for the bag-of-tokens
- *   ranking failures diagnosed 2026-08-11 (anatomy_06/guideline_01/
- *   guideline_10). Also affects totalWeight and therefore overlap_pct and
+ *   ranking failures diagnosed 2026-08-11 against a 130-query internal
+ *   benchmark set. Also affects totalWeight and therefore overlap_pct and
  *   the threshold cutoff, consistently — all three derive from the same
  *   per-token weight value, so nothing needed separate handling.
  * @param {boolean} [options.truncate=true] - Slice the above-threshold, sorted match
@@ -507,11 +505,11 @@ async function searchToken(client, token, fpd, dataset, pqr = true, hmac = false
  *   corpus (docCount 0, weight forced to 1 — see tokenWeight()'s docCount=0
  *   note): merged into a group with a real variant, the union simply
  *   equals the real variant's own doc set, so no permanently-unmatchable
- *   weight gets baked into totalWeight. Diagnosed 2026-08-14 against
- *   technique_08/dose_06/dose_08, which round-2 case-duplication (sending
- *   both case forms as independent tokens, no merge) regressed to zero
- *   results despite round-1 (no duplication) returning full result sets —
- *   see dmm-round2-tuning notes.
+ *   weight gets baked into totalWeight. Diagnosed 2026-08-14 against a set
+ *   of benchmark queries where round-2 case-duplication (sending both case
+ *   forms as independent tokens, no merge) regressed to zero results
+ *   despite round-1 (no duplication) returning full result sets — see
+ *   dmm-round2-tuning notes.
  * @returns {Promise<SimilarityResult>}
  */
 async function similaritySearch(client, text, {
@@ -530,7 +528,7 @@ async function similaritySearch(client, text, {
   // v1.9.0 — fail fast on a missing/invalid PQR key, ONCE, up front, but
   // ONLY when hmac:true was actually requested. hmac defaults to false, so
   // by default this never fires and existing data (ingested under the
-  // unkeyed V1.3.0 scheme, e.g. an already-loaded Lindisfarne corpus) keeps
+  // unkeyed V1.3.0 scheme, e.g. an already-loaded production corpus) keeps
   // working with zero config.
   //
   // Without this eager check, a missing key on an hmac:true call would
