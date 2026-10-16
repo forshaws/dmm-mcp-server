@@ -511,6 +511,43 @@ server.tool(
   }
 );
 
+// ── Tool: tqnn_remove ─────────────────────────────────────────────────────────
+server.tool(
+  'tqnn_remove',
+  'Remove a document from TQNN DMM associative memory. Deletes every token association linked to the filereference in the dataset (all store events for that filereference). Destructive — requires WRITE permission. To replace a document: call tqnn_remove on the old filereference, then tqnn_store the new data. Returns REMOVE_OK, or NOT_FOUND if nothing matched (including a repeat call).',
+  {
+    filereference: z.string().describe('The filereference to remove, as passed to tqnn_store e.g. memory://claude/session/2026-06-20:: A DMM-appended timestamp is stripped automatically.'),
+    dataset: z.string().optional().describe('Optional: target dataset/namespace. Overrides server default.')
+  },
+  async ({ filereference, dataset }) => {
+    try {
+      const stripped = stripTimestamp(filereference.trim());
+      const ref = stripped.endsWith('::') ? stripped : stripped + '::';
+      const result = await client.removeDoc(ref, dataset);
+      const removed = (result.tqnn_response || '').includes('REMOVE_OK');
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            removed,
+            filereference: ref,
+            buckets_scanned: result.buckets_scanned,
+            lines_removed: result.lines_removed,
+            tuples_deleted: result.tuples_deleted,
+            weight_mode_buckets_skipped: result.weight_mode_buckets_skipped,
+            dmm_response: result.tqnn_response
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }],
+        isError: true
+      };
+    }
+  }
+);
+
 // ── Tool: tqnn_get ────────────────────────────────────────────────────────────
 server.tool(
   'tqnn_get',

@@ -65,6 +65,20 @@ class TQNNClient {
   }
 
   /**
+   * Remove every token/cache entry linked to a file reference.
+   * Goes off the file reference alone; needs WRITE permission.
+   * @param {string} filereference - URI/path ending with :: (no timestamp)
+   * @param {string} [dataset] - Optional dataset override
+   * @returns {Promise<ApiResponse>}
+   */
+  async removeDoc(filereference, dataset) {
+    return this._post('/v1/removeDoc', {
+      filereference,
+      ...(dataset || this.dataset ? { dataset: dataset || this.dataset } : {})
+    });
+  }
+
+  /**
    * Lightweight connectivity ping using a known-harmless token.
    *
    * v1.9.0 — DELIBERATELY does NOT use the real (keyed) PQR pipeline from

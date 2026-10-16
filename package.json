@@ -1,6 +1,6 @@
 {
   "name": "tqnn-mcp-server",
-  "version": "1.0.0",
+  "version": "1.9.0",
   "description": "MCP server exposing TQNN DMM associative memory as callable tools for Claude and other MCP-compatible LLMs",
   "main": "index.js",
   "type": "commonjs",
@@ -16,6 +16,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.25.0"
   }
 }
