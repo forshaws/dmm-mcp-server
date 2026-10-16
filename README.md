@@ -1,10 +1,10 @@
 # tqnn-mcp-server
 
-MCP (Model Context Protocol) server that exposes the **TQNN DMM** associative memory API as callable tools for Claude and other MCP-compatible LLMs..
+MCP (Model Context Protocol) server that exposes the **TQNN DMM** associative memory API as callable tools for Claude and other MCP-compatible LLMs.
 
 This makes DMM a **live memory layer inside the LLM context window** — Claude can call TQNN's associative retrieval during inference without DMM knowing anything about LLMs.
 
-Licence: [MIT](https://opensource.org/licenses/MIT)
+Server v1.9.0 · Licence: [MIT](https://opensource.org/licenses/MIT)
 
 ---
 
@@ -14,7 +14,7 @@ Licence: [MIT](https://opensource.org/licenses/MIT)
 Claude (reasoning/generation)
         │  MCP tool calls  [OAuth 2.1 Bearer token]
         ▼
-tqnn-mcp-server  ◄──── similarity orchestration, overlap scoring, PQR/FPD opt-in,
+tqnn-mcp-server  ◄──── similarity orchestration, overlap scoring, PQR/HMAC/FPD opt-in,
         │               per-employee auth + DMM credential routing
         │  multipart/form-data HTTP
         ▼
@@ -25,7 +25,7 @@ TQNN DMM appliance  ◄──── pure associative memory primitive (searchDoc
 
 DMM is a pure associative-memory primitive: an input goes in, an O(1)-addressable key comes out, on both the store and search side. `storeDoc.php` splits every field name and value on whitespace/punctuation and hashes each resulting word with its own fixed-width token function, unconditionally — this happens regardless of what the client sends. `searchDoc.php` treats its incoming pattern as a single opaque string, strips it to alphanumeric+underscore, and hashes it once as a single atomic lookup key — it does not tokenise a multi-word query into separate searches.
 
-Everything above that — deciding whether to pre-hash a value before sending it (`pqr`), whether to cross-check a reversed hash to filter false positives (`fpd`), how a free-text query gets split into individual search calls, how those results get combined and ranked, employee auth, and DMM credential routing — is client-side logic implemented in this server, not part of DMM itself. **Dataset-level access control itself is enforced at the appliance**, not here — see [Authentication & per-employee access](#authentication--per-employee-access) for exactly where the line sits.
+Everything above that — deciding whether to pre-hash a value before sending it (`pqr`), whether to key that hash with a secret (`hmac`), whether to cross-check a reversed hash to filter false positives (`fpd`), how a free-text query gets split into individual search calls, how those results get combined and ranked, employee auth, and DMM credential routing — is client-side logic implemented in this server, not part of DMM itself. **Dataset-level access control itself is enforced at the appliance**, not here — see [Authentication & per-employee access](#authentication--per-employee-access) for exactly where the line sits.
 
 ---
 
@@ -34,28 +34,30 @@ Everything above that — deciding whether to pre-hash a value before sending it
 | Tool | Description |
 |---|---|
 | `tqnn_status` | Ping DMM — confirm connectivity at session start |
-| `tqnn_search` | Single `searchDoc` call — exact associative match on one query term. `pqr` (default `false`) and `fpd` (default `false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
-| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results, IDF-weighted token overlap scoring. `pqr` (default `true`) and `fpd` (default `true`, ignored when `pqr:false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
+| `tqnn_discover_datasets` | List the datasets the current DMM credential can access (`scope`: `owner` or `sub_credential`, plus `permissions`). Takes no arguments |
+| `tqnn_search` | Single `searchDoc` call — exact associative match on one query term. `pqr`, `hmac` and `fpd` (all default `false`) — see [Query modes](#query-modes-pqr-hmac-fpd-and-plain) below |
+| `tqnn_similarity` | Multi-call similarity orchestration — free text → ranked results, IDF-weighted token overlap scoring. `pqr` (default `true`), `hmac` (default `false`) and `fpd` (default `true`, ignored when `pqr:false`) — see [Query modes](#query-modes-pqr-hmac-fpd-and-plain) below |
 | `tqnn_similarity_plain` | Same weighted-overlap algorithm as `tqnn_similarity`, always in plain (unhashed) mode — equivalent to calling `tqnn_similarity` with `pqr:false`, exposed as its own tool for callers who want a plaintext-only entry point with no flags to set |
-| `tqnn_store` | `storeDoc` wrapper — write associations into DMM. `pqr` (default `false`) and `fpd` (default `false`) — see [Query modes](#query-modes-pqr-fpd-and-plain) below |
+| `tqnn_store` | `storeDoc` wrapper — write associations into DMM. `pattern` is a JSON array of metadata objects, e.g. `[{"title":"Report","year":2024}]`; `filereference` should end in `::` (appended if missing). `pqr`, `hmac`, `fpd` and `create_ots` (all default `false`) — see [Query modes](#query-modes-pqr-hmac-fpd-and-plain) below |
 | `tqnn_get` | Resolver — retrieve content for any filereference via ping / info / fetch. See [docs/resolvers.md](docs/resolvers.md) |
 
-`pqr` and `fpd` default to `false` on `tqnn_search` and `tqnn_store`, matching the DMM REST API and Workbench convention where both are opt-in. `tqnn_similarity` defaults `pqr` to `true` instead — `tqnn_similarity_plain` is the explicit, flagless route to its `pqr:false` behaviour.
+`pqr`, `hmac` and `fpd` default to `false` on `tqnn_search` and `tqnn_store`, matching the DMM REST API and Workbench convention where all three are opt-in. `tqnn_similarity` defaults `pqr` to `true` instead — `tqnn_similarity_plain` is the explicit, flagless route to its `pqr:false` behaviour.
 
 ---
 
-## Query modes: PQR, FPD, and plain
+## Query modes: PQR, HMAC, FPD, and plain
 
-Three independent tools — `tqnn_search`, `tqnn_store`, `tqnn_similarity` — share the same two boolean flags. What they mean, and what must match between store and search for a lookup to succeed:
+Three independent tools — `tqnn_search`, `tqnn_store`, `tqnn_similarity` — share the same boolean flags. What they mean, and what must match between store and search for a lookup to succeed:
 
 | Flag | Effect | Default |
 |---|---|---|
 | `pqr` | PQR-hash the value client-side before sending it to DMM, using the same self-salting scheme DMM's own `tqnnToken16()` uses. | `false` on `tqnn_search`/`tqnn_store`, `true` on `tqnn_similarity` |
+| `hmac` | With `pqr:true`, use the keyed HMAC-SHA256 construction instead of the unkeyed self-salting scheme. Requires `TQNN_PQR_KEY` on the server (see [Configuration](#configuration)); the call errors if it is missing. Ignored when `pqr:false`. Not available on `tqnn_similarity_plain`. | `false` everywhere |
 | `fpd` | False Positive Defence — make a second call on the reversed input string's hash, and keep only results present in both the forward and reversed searches. Requires `pqr:true` on both the store and search side; ignored (and reported as `false`) whenever `pqr:false`, since there is no hash to reverse. | `false` everywhere except `tqnn_similarity` (`true`) |
 
 **Plain mode** (`pqr:false`) sends the value to DMM untouched. This still works for full free-text search, including multi-word values and purely numeric ones — DMM's own `storeDoc.php` tokenises and hashes every word server-side regardless of what the client sends (see [Architecture](#architecture)), so a plain-stored record is just as independently searchable, word by word, as a PQR-stored one.
 
-**Matching matters, not hashing itself.** A value stored with `pqr:true` produces a different (double-transformed) key than the same value stored with `pqr:false`, because DMM hashes on top of whatever the client sends either way. Searching with a `pqr` setting that doesn't match how the record was stored produces zero results, silently — there's no error, the search simply never reaches the right key. The rule of thumb: whatever `pqr` (and, if used, `fpd`) a record was stored with, search for it with the same setting.
+**Matching matters, not hashing itself.** A value stored with `pqr:true` produces a different (double-transformed) key than the same value stored with `pqr:false`, because DMM hashes on top of whatever the client sends either way. Searching with a `pqr` setting that doesn't match how the record was stored produces zero results, silently — there's no error, the search simply never reaches the right key. The rule of thumb: whatever `pqr` (and, if used, `hmac` and `fpd`) a record was stored with, search for it with the same setting — and, for `hmac`, the same `TQNN_PQR_KEY`.
 
 `tqnn_similarity_plain` and `tqnn_similarity` called with `pqr:false` are the same code path — pick whichever is more convenient for the caller.
 
@@ -66,7 +68,7 @@ Three independent tools — `tqnn_search`, `tqnn_store`, `tqnn_similarity` — s
 | Mode | Use case | Auth |
 |---|---|---|
 | `stdio` | Claude Code, local development | None — credentials from environment |
-| `sse` | claude.ai remote connector, production | OAuth 2.1 required, optionally per-employee (see below) |
+| `sse` | HTTP server for the claude.ai remote connector (`/mcp`, Streamable HTTP) and legacy SSE clients such as DMM Workbench (`/sse` + `/messages`), production | OAuth 2.1 required, optionally per-employee (see below) |
 
 ---
 
@@ -126,9 +128,9 @@ That's it — Claude Code picks it up automatically. Per-employee accounts (belo
 
 ---
 
-#### Option B — claude.ai remote connector (SSE + OAuth 2.1)
+#### Option B — claude.ai remote connector (HTTP + OAuth 2.1)
 
-This is the production path. The server runs in SSE mode behind ngrok, with a
+This is the production path. The server runs in `sse` mode (which serves `/mcp` and `/sse`) behind ngrok, with a
 self-contained OAuth 2.1 authorization server handling authentication.
 
 **How the OAuth flow works:**
@@ -136,7 +138,7 @@ self-contained OAuth 2.1 authorization server handling authentication.
 ```
 claude.ai                           tqnn-mcp-server (Pi5 / server)
 ─────────                           ───────────────────────────────
-GET /sse  ──────────────────────►  401 + WWW-Authenticate: Bearer resource_metadata=…
+POST /mcp  ─────────────────────►  401 + WWW-Authenticate: Bearer resource_metadata=…
 GET /.well-known/oauth-protected-resource  ◄──  { resource, authorization_servers }
 GET /.well-known/oauth-authorization-server ◄──  { authorization_endpoint, token_endpoint, … }
 POST /oauth/register  ──────────►  { client_id, client_secret }  [auto, no user action]
@@ -144,9 +146,10 @@ GET /oauth/authorize  ──────────►  HTML consent form
   ↕  you log in in your browser
 POST /oauth/authorize ──────────►  302 → claude.ai/api/mcp/auth_callback?code=…
 POST /oauth/token     ──────────►  { access_token, refresh_token, … }
-GET /sse (Authorization: Bearer …)  ──────────────────────────►  SSE stream open
-POST /messages (Authorization: Bearer …)  ────────────────────►  MCP tool responses
+POST /mcp (Authorization: Bearer …)  ─────────────────────────►  MCP session (Streamable HTTP)
 ```
+
+Legacy SSE clients (e.g. DMM Workbench) use the same OAuth flow with `GET /sse` and `POST /messages` in place of `/mcp`.
 
 Token lifetime: 1 hour access / 30 days refresh (rotated on each use). All state is
 in-memory — a server reboot means users re-authenticate with one click in claude.ai.
@@ -229,9 +232,9 @@ curl https://your-ngrok-url.ngrok-free.app/health
 **Step 4 — Connect claude.ai**
 
 1. Go to **claude.ai → Settings → Integrations → Add MCP Server**
-2. Paste your SSE URL:
+2. Paste your server URL:
    ```
-   https://your-ngrok-url.ngrok-free.app/sse
+   https://your-ngrok-url.ngrok-free.app/mcp
    ```
 3. Leave the OAuth Client ID / Client Secret fields **blank** — claude.ai registers
    itself automatically via Dynamic Client Registration.
@@ -311,7 +314,7 @@ git pull
 pm2 restart tqnn-mcp
 ```
 
-Remember: `tqnn_resolvers.json`, `tqnn_mcp_users.json`, and `tqnn_mcp_credentials.json` are all cached in-process (by mtime for the latter two, at startup for the resolver config) — edits to any of them need a restart (or, for the two per-employee JSON files, take effect on the very next request with no restart at all — see below).
+Remember: `tqnn_resolvers.json`, `tqnn_mcp_users.json`, and `tqnn_mcp_credentials.json` are all cached in-process (by mtime for the latter two, from the first `tqnn_get` call for the resolver config) — edits to any of them need a restart (or, for the two per-employee JSON files, take effect on the very next request with no restart at all — see below).
 
 ---
 
@@ -388,6 +391,7 @@ Separately, this file maps each authenticated employee (by username, matching th
 | `TQNN_MCP_SECRET` | *(required in SSE mode)* | HMAC secret for token signing (≥32 chars) |
 | `TQNN_OAUTH_USER` | `admin` | Username for the OAuth consent page — legacy/fallback login, superseded per-user by `tqnn_mcp_users.json` when present |
 | `TQNN_OAUTH_PASS` | *(required in SSE mode)* | Password for the OAuth consent page — same fallback scope as above |
+| `TQNN_PQR_KEY` | *(unset)* | HMAC key for `hmac:true` tool calls (≥32 chars, used as a literal UTF-8 string, not base64-decoded). Optional — only needed when `hmac:true` is used; calls fail with a clear error if it is missing or short. Read once and cached (`pm2 restart` after changing). Separate from `TQNN_MCP_SECRET`. Generate: `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` |
 | `CORS_ORIGIN` | `*` | Restrict to `https://claude.ai` in production |
 
 Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_credentials.json`) are file-based, not env-configured — see [Authentication & per-employee access](#authentication--per-employee-access) above.
@@ -404,10 +408,11 @@ Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_
 
 ## Implementation notes
 
-- **DMM's internal token function** — both `storeDoc.php` and `searchDoc.php` run every value they handle through the same self-salting scheme, independently of anything this server does: `h1 = SHA-256(input)` → `mixed = input + h1` → `padded = mixed.slice(0, 16)` → `token = SHA-256(padded).slice(0, 16)`. The salt is derived from the input itself, so it defeats rainbow-table attacks without needing external key material or extra storage, and every input is lifted into the full 2²⁵⁶ hash space regardless of its own entropy. This happens on the appliance whether or not this server's `pqr` flag is set — see [Query modes](#query-modes-pqr-fpd-and-plain) for what `pqr` actually controls at the client layer. The old constant-padding scheme (padding short tokens with `*`) is superseded and kept in `similarity.js` only for reference/rollback — it's vulnerable to rainbow tables on low-entropy fields. **Any dataset still stored under the old scheme needs re-ingesting** before it will match self-salted search hashes.
+- **DMM's internal token function** — both `storeDoc.php` and `searchDoc.php` run every value they handle through the same self-salting scheme, independently of anything this server does: `h1 = SHA-256(input)` → `mixed = input + h1` → `padded = mixed.slice(0, 16)` → `token = SHA-256(padded).slice(0, 16)`. The salt is derived from the input itself, so no precomputed table covers it; the token is a deterministic function of the input and is not secret. This happens on the appliance whether or not this server's `pqr` flag is set — see [Query modes](#query-modes-pqr-hmac-fpd-and-plain) for what `pqr` and `hmac` control at the client layer. The old constant-padding scheme (padding short tokens with `*`) is superseded and kept in `similarity.js` only for reference/rollback — it's vulnerable to rainbow tables on low-entropy fields. **Any dataset still stored under the old scheme needs re-ingesting** before it will match self-salted search hashes.
 - **FPD** — False Positive Defence: two `searchDoc` calls per token (forward + reversed input string), AND the result sets. Only filereferences in both are genuine. Implemented identically in `tqnn_store`, `tqnn_search`, and `tqnn_similarity`; requires `pqr:true`, since there's no hash to reverse in plain mode.
+- **HMAC** — `hmac:true` (with `pqr:true`) applies HMAC-SHA256 with `TQNN_PQR_KEY` at both steps of the same construction: `h1 = HMAC(key, input)` → `padded = (input + h1).slice(0, 16)` → `token = HMAC(key, padded).slice(0, 16)`. It is computed in this server; the appliance never receives the key and applies its own unkeyed token function to the 16-character token it is sent. Store and search must use the same key; changing the key requires re-ingesting the data.
 - **Filelist** — DMM returns filelist as newline-delimited string, not JSON array.
-- **Timestamps** — DMM appends a raw unix timestamp directly onto whatever filereference string it's given, with no separator of its own. This is why every filereference written to DMM should always end in `::` — that trailing `::` is what lets the timestamp be stripped cleanly back off on read (split on the *last* `::`, keep everything before it). One consequence worth knowing: if the original filereference had *only one* `::`-terminated segment at the very end (e.g. `pool::lba5::sectors1::`, no fpd suffix), the returned filereference after strip has **no trailing `::` at all** (`pool::lba5::sectors1`). If it had a `::`-delimited suffix after that (e.g. an `fpd_XXXXXXXX::` specialcode), one `::` survives in the middle. Either way: never write a custom resolver handler that requires a trailing `::` to parse correctly — split the string on `::` and match tokens by position instead. See [docs/resolvers.md](docs/resolvers.md) for the full explanation and both handlers (`local_blob`, `local_lba`) that already do this correctly.
+- **Timestamps** — DMM appends a raw unix timestamp directly onto whatever filereference string it is given, with no separator of its own. This is why every filereference written to DMM should end in `::`. `stripTimestamp` (`similarity.js`) and `normaliseRef` (`resolver.js`) remove the trailing digits after the final `::` and return the filereference exactly as stored, trailing `::` included (`pool::lba5::sectors1::`). Custom resolver handlers should split the string on `::` and match segments by position. See [docs/resolvers.md](docs/resolvers.md) for both built-in handlers (`local_blob`, `local_lba`) that do this.
 - **TLS** — `NODE_TLS_REJECT_UNAUTHORIZED=0` for tqnn.local only. Remove for any public HTTPS DMM endpoint with a valid cert.
 - **Node 18+** — uses built-in `FormData`, `fetch`, and `crypto`. No extra HTTP packages required.
 - **OAuth tokens** — HMAC-SHA256 signed, 1-hour lifetime, constant-time validation. Refresh tokens rotate on use (30-day lifetime). All state in-memory. Token validation also carries a live per-employee revocation check (see [Authentication & per-employee access](#authentication--per-employee-access)) — this is in addition to, not instead of, signature/expiry checks.
@@ -416,10 +421,12 @@ Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_
 
 ## Security
 
-- OAuth 2.1 with PKCE (S256) is enforced on all SSE endpoints. Unauthenticated requests receive `401 + WWW-Authenticate`.
+- OAuth 2.1 with PKCE (S256) is enforced on `/mcp`, `/sse` and `/messages`. Unauthenticated requests receive `401 + WWW-Authenticate`.
 - `TQNN_OAUTH_PASS` is SHA-256 hashed immediately on startup and never held in memory as plaintext. Per-employee passwords in `tqnn_mcp_users.json` use scrypt with a random salt per entry (`salt_hex:hash_hex`), verified in constant time.
 - Token comparisons use `crypto.timingSafeEqual` throughout.
 - Dynamic Client Registration is open (no pre-shared secret required) — consistent with the MCP spec and how claude.ai connects. `tqnn_store` is still protected behind OAuth.
+- `TQNN_PQR_KEY` is a secret: keep it in `.env` with restricted permissions and do not commit it. It never leaves this server. Losing it makes data stored with `hmac:true` unsearchable.
+- Filereferences are stored and returned by DMM unhashed. Use opaque IDs; do not put names, ID numbers or other personal data in a filereference.
 - Set `CORS_ORIGIN=https://claude.ai` in `.env` for production deployments.
 - Remove `NODE_TLS_REJECT_UNAUTHORIZED=0` if your DMM appliance uses a properly signed certificate.
 - `tqnn_mcp_credentials.json` and `tqnn_mcp_users.json` contain (or reference) credentials/secrets — treat them like `.env`, not like general-purpose config: don't commit real values, and restrict file permissions on the server the same way you would for `.env`.
@@ -445,6 +452,9 @@ Per-employee login and DMM credential routing (`tqnn_mcp_users.json`, `tqnn_mcp_
 **An employee's access won't revoke / they can still call tools after being disabled**
 - Confirm their entry in `tqnn_mcp_users.json` has `"status": "disabled"` exactly (not `"inactive"` or removed entirely — a missing entry falls through to "no per-employee accounts configured" logic differently than an explicitly disabled one in edge cases, so prefer explicit disabling over deletion).
 - This check is live on every request, so if access is still working, first confirm the file actually saved / the edit reached the server the process is running on.
+
+**`hmac:true` returns "TQNN_PQR_KEY is missing or too short"**
+- Set `TQNN_PQR_KEY` (≥32 chars) in `.env` and `pm2 restart tqnn-mcp`. Use the same key that was used when the data was stored.
 
 **"Session not found" after approving**
 - The server restarted between authorization and the first tool call. Reconnect the integration in claude.ai.
