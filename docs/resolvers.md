@@ -27,7 +27,7 @@ Filereferences that begin with `[a-zA-Z0-9]+_` (letters/numbers followed by an u
 | `records_` | `records_0002.jsonl::line5975::REC-00025975::` |
 | `invoices_` | `invoices_2024::INV-00293::acme-corp::` |
 | `contracts_` | `contracts_acme::CLT-00042::v3::` |
-| `patients_` | `patients_NHS::7857655619::ruby-smith::` |
+| `patients_` | `patients_cohort1::8f3a91c2::` |
 
 **Anything that does not match `[a-zA-Z0-9]+_` is a non-logical reference** — full URLs, Windows drive letters, UNC paths, mount points. These are routed to the `*` catch-all webhook entry, where developer middleware handles translation. DMM filereferences never need to change even when storage topology does.
 
@@ -35,7 +35,7 @@ Filereferences that begin with `[a-zA-Z0-9]+_` (letters/numbers followed by an u
 
 ## tqnn_resolvers.json
 
-Drop this file in the `dmm-mcp-server` root directory alongside `index.js`. The server loads it on first tool call and caches it for the session. Changes require `pm2 restart tqnn-mcp`.
+Drop this file in the `dmm-mcp-server` root directory alongside `index.js`. The server loads it on the first `tqnn_get` call and caches it until restart. Changes require `pm2 restart tqnn-mcp`.
 
 ### Minimal example — all use cases
 
@@ -310,6 +310,45 @@ Handles `memory://` filereferences written by `tqnn_store` during the current se
 
 ---
 
+### `url`
+
+Fetches the filereference itself as an HTTP(S) URL. The filereference is the URL followed by `::`, e.g. `https://example.com/doc.pdf::`. `ping` and `info` use a `HEAD` request; `fetch` uses `GET`. Text content is returned inline, other content as base64, and large responses are zipped per `fetch_options`.
+
+```json
+{
+  "scheme": "https://",
+  "type": "url",
+  "handler": "url",
+  "config": { "timeout_ms": 8000, "max_fetch_bytes": 10485760 }
+}
+```
+
+| Key | Description |
+|---|---|
+| `timeout_ms` | Request timeout (default 8000) |
+| `max_fetch_bytes` | Maximum response size for `fetch` (default 10 MB); larger responses return `TOO_LARGE` |
+
+A non-2xx response returns `HTTP_ERROR` with `http_status`; a network failure returns `UNREACHABLE`.
+
+---
+
+### `chunk_index`
+
+O(1) lookup of a bare chunk ID (no namespace prefix) in a single large JSONL corpus, using a prebuilt sorted index of `chunk_id → byte offset, byte length` (built by `build_chunk_index.py`, searched by `chunk-index.js`). A fetch is one read at a known offset, with no scan of the corpus.
+
+Because bare IDs carry no prefix, the entry is matched by shape using `id_pattern` (a regex tested against the whole filereference) instead of `scheme`. `id_pattern` entries are checked after explicit prefix schemes and before the logical-namespace / `*` fallback; the first match wins, so keep `id_pattern` entries mutually exclusive.
+
+| Key | Description |
+|---|---|
+| `id_pattern` | Regex matched against the filereference |
+| `corpus_path` | Path to the JSONL corpus file (required) |
+| `index_path` | Path to the sorted chunk index (required) |
+| `max_fetch_bytes` | Maximum chunk size for `fetch` (default 1 MB) |
+
+If `corpus_path` or `index_path` is missing the handler returns `RESOLVER_NOT_CONFIGURED`.
+
+---
+
 ## Operations
 
 Every `tqnn_get` call specifies one of three operations:
@@ -326,16 +365,14 @@ Always `ping` or `info` before `fetch` for large or cold resources.
 
 ## Timestamp round-trip and filereference parsing
 
-DMM appends a raw unix timestamp directly onto whatever filereference string it's given at write time — no separator of its own. This is why **every filereference you write should always end in `::`**: that trailing `::` is what lets the timestamp be stripped cleanly back off on read (DMM splits on the *last* `::` in the string and returns everything before it).
+DMM appends a raw unix timestamp directly onto whatever filereference string it is given at write time, with no separator of its own. This is why **every filereference you write should end in `::`**.
 
-The consequence worth knowing: what comes back from `searchDoc`/`multiSearchDoc` does **not reliably still have that trailing `::`**.
+`searchDoc` returns `<filereference><timestamp>`. `normaliseRef` (`resolver.js`) removes the trailing digits after the final `::` and returns the filereference exactly as written, trailing `::` included:
 
-- Written: `sn655_pool_001::lba1380::sectors1::` → timestamp appended → `sn655_pool_001::lba1380::sectors1::1720685440` → strip back to last `::` → returned as `sn655_pool_001::lba1380::sectors1` — **no trailing `::` at all.**
-- Written: `sn655_pool_001::lba1380::sectors1::fpd_2d29e514::` (with an fpd specialcode) → same append-and-strip → returned as `sn655_pool_001::lba1380::sectors1::fpd_2d29e514` — one `::` survives in the middle, purely because there was a segment after it.
+- Written: `sn655_pool_001::lba1380::sectors1::` → returned by DMM as `sn655_pool_001::lba1380::sectors1::1720685440` → `normaliseRef` → `sn655_pool_001::lba1380::sectors1::`
+- Written: `sn655_pool_001::lba1380::sectors1::fpd_2d29e514::` → `sn655_pool_001::lba1380::sectors1::fpd_2d29e514::`
 
-Both are correct, expected behaviour — not a bug in DMM or in either resolver. But it means **any parsing logic that assumes a filereference ends in `::` will intermittently fail**, and the failure is easy to miss during testing if your test records happen to all use `fpd` (which coincidentally leaves a `::` in the middle and can mask the problem).
-
-**The fix used by both `local_blob` and `local_lba`:** split the whole string on `::` and match each resulting token fully anchored (`/^off(\d+)$/`, `/^lba(\d+)$/`), then access by array position (`parts[1]`, `parts[2]`). This is completely indifferent to whether a trailing `::` survived — `"a::b::c".split('::')` and `"a::b::c::".split('::')` both put `b` at index 1 and `c` at index 2; the only difference is a harmless trailing empty string in the second case. If you write a custom handler (see below), parse this way, not with a whole-string regex anchored to the end.
+Handlers receive the normalised reference. **Parse by splitting on `::`** (remove a trailing `::` first with `normaliseRef(ref).replace(/::$/, '')`, or tolerate the trailing empty string), match each token fully anchored (`/^off(\d+)$/`, `/^lba(\d+)$/`), then access by array position (`parts[1]`, `parts[2]`). `local_blob` and `local_lba` parse this way; custom handlers (below) should too.
 
 ---
 
@@ -353,6 +390,8 @@ Both are correct, expected behaviour — not a bug in DMM or in either resolver.
 | `TOO_LARGE` | File exceeds `max_fetch_bytes` — use `info` to inspect first |
 | `PASSTHROUGH_NOT_CONFIGURED` | Non-logical ref with no `*` catch-all webhook configured |
 | `WEBHOOK_UNREACHABLE` | Webhook endpoint did not respond |
+| `UNREACHABLE` | `url`, `local_blob` or `local_lba` target could not be reached |
+| `HTTP_ERROR` | `url` handler: target returned a non-2xx status (`http_status`) |
 | `ERROR` | Unhandled resolver error — check server logs |
 
 ---
@@ -363,7 +402,7 @@ Both are correct, expected behaviour — not a bug in DMM or in either resolver.
 
 ### Example: record ID → file lookup
 
-If you want filereferences like `patients_NHS::7857655619::` to map to individual JSON files by NHS number rather than JSONL line extraction, add a custom handler in `resolver.js`:
+If you want filereferences like `patients_cohort1::8f3a91c2::` to map to individual JSON files by record ID rather than JSONL line extraction, add a custom handler in `resolver.js`:
 
 *(This example already parses correctly per the [timestamp round-trip note](#timestamp-round-trip-and-filereference-parsing) above — it splits on `::` and accesses by position, so it works whether or not the trailing `::` survived the write/read round trip.)*
 
@@ -382,7 +421,7 @@ async function handleLocalJsonById(ref, operation, resolverConfig) {
   const basePath = cfg.base_path || '/home/tqnn/data/';
 
   // Extract record ID from filereference
-  // e.g. "patients_NHS::7857655619::ruby-smith::" → "7857655619"
+  // e.g. "patients_cohort1::8f3a91c2::" → "8f3a91c2"
   const parts = normaliseRef(ref).replace(/::$/, '').split('::');
   const recordId = parts[1]; // second segment after the namespace
   const filepath = path.join(basePath, `${recordId}.json`);
@@ -487,7 +526,7 @@ The filereference you write at ingest time is the retrieval contract. Follow the
 - For individual files: `namespace_id::record-id::`
 - For databases: `namespace_table::primary-key::`
 
-**Use NHS numbers, invoice IDs, contract IDs as record identifiers** — not names or emails. Structured identifiers index cleanly as single tokens. Email addresses containing `.` and `@` are stripped by the tokeniser and should be stored as a separate token if searchability is required.
+**Use opaque record identifiers** (invoice IDs, contract IDs, surrogate keys) — not names, email addresses or ID numbers such as NHS numbers. DMM stores and returns filereferences unhashed.
 
 **Always terminate the filereference you write with `::`.** DMM appends a raw timestamp on write with no separator of its own, and strips back to the last `::` on read — a filereference that didn't end in `::` at write time can't be recovered cleanly. See [Timestamp round-trip and filereference parsing](#timestamp-round-trip-and-filereference-parsing) above for what this means for anyone reading filereferences back, including in a custom handler.
 
